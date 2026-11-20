@@ -1,0 +1,21 @@
+project_id: '927407'
+api_token_env: CROWDIN_PERSONAL_TOKEN
+base_path: .
+preserve_hierarchy: true
+
+files:
+  - source: /app/src/main/res/values/strings.xml
+    translation: /app/src/main/res/values-%android_code%/strings.xml
+    type: android
+    languages_mapping:
+      android_code:
+        fr: fr
+        zh-CN: zh-rCN
+        zh-TW: zh-rTW
+        es-ES: es
+        de: de
+        pt-BR: pt-rBR
+        ja: ja
+        ko: ko
+        it: it
+        vi: vi

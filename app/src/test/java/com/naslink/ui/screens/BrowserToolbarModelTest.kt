@@ -1,0 +1,140 @@
+package com.naslink.ui.screens
+
+import com.naslink.R
+import com.naslink.data.model.ViewMode
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class BrowserToolbarModelTest {
+
+    @Test
+    fun viewModesHaveUserFacingLabels() {
+        assertEquals(R.string.view_mode_list, ViewMode.LIST.labelRes)
+        assertEquals(R.string.view_mode_compact_list, ViewMode.COMPACT.labelRes)
+        assertEquals(R.string.view_mode_grid, ViewMode.GRID.labelRes)
+    }
+
+    @Test
+    fun remoteToolbarMovesDisconnectToOverflow() {
+        val model = BrowserToolbarModel.forState(isRemote = true)
+
+        assertFalse(model.primaryActions.contains(BrowserToolbarAction.DISCONNECT))
+        assertTrue(model.overflowActions.contains(BrowserToolbarAction.DISCONNECT))
+    }
+
+    @Test
+    fun localToolbarDoesNotExposeDisconnect() {
+        val model = BrowserToolbarModel.forState(isRemote = false)
+
+        assertFalse(model.primaryActions.contains(BrowserToolbarAction.DISCONNECT))
+        assertFalse(model.overflowActions.contains(BrowserToolbarAction.DISCONNECT))
+    }
+
+    @Test
+    fun selectionToolbarKeepsOnlyCoreDestructiveActionsVisible() {
+        val model = SelectionToolbarModel.forState(
+            isRemote = false,
+            selectionCount = 3,
+            canShare = false,
+        )
+
+        assertTrue(model.primaryActions.contains(SelectionToolbarAction.COPY))
+        assertTrue(model.primaryActions.contains(SelectionToolbarAction.DELETE))
+        assertTrue(model.primaryActions.size <= 3)
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.CUT))
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.SELECT_ALL))
+        assertFalse(model.overflowActions.contains(SelectionToolbarAction.RENAME))
+    }
+
+    @Test
+    fun remoteSingleSelectionExposesDownloadAndPrimaryRename() {
+        val model = SelectionToolbarModel.forState(
+            isRemote = true,
+            selectionCount = 1,
+            canShare = false,
+        )
+
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.DOWNLOAD))
+        assertTrue(model.primaryActions.contains(SelectionToolbarAction.RENAME))
+    }
+
+    @Test
+    fun shareableSingleSelectionPromotesShareRenameAndDelete() {
+        val model = SelectionToolbarModel.forState(
+            isRemote = false,
+            selectionCount = 1,
+            canShare = true,
+        )
+
+        assertEquals(
+            listOf(
+                SelectionToolbarAction.SHARE,
+                SelectionToolbarAction.RENAME,
+                SelectionToolbarAction.DELETE,
+            ),
+            model.primaryActions,
+        )
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.COPY))
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.CUT))
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.DETAILS))
+    }
+
+    @Test
+    fun multipleRemoteSelectionKeepsShareHiddenAndOffersRename() {
+        val model = SelectionToolbarModel.forState(
+            isRemote = true,
+            selectionCount = 2,
+            canShare = false,
+        )
+
+        assertEquals(
+            listOf(SelectionToolbarAction.COPY, SelectionToolbarAction.RENAME, SelectionToolbarAction.DELETE),
+            model.primaryActions,
+        )
+        assertFalse(model.primaryActions.contains(SelectionToolbarAction.SHARE))
+        assertFalse(model.overflowActions.contains(SelectionToolbarAction.RENAME))
+        assertTrue(model.overflowActions.contains(SelectionToolbarAction.DOWNLOAD))
+    }
+
+    @Test
+    fun oneLocalFileOffersOpenWithInOverflow() {
+        val model = SelectionToolbarModel.forState(
+            isRemote = false,
+            selectionCount = 1,
+            canShare = true,
+            canOpenWith = true,
+        )
+
+        assertTrue(SelectionToolbarAction.OPEN_WITH in model.overflowActions)
+    }
+
+    @Test
+    fun foldersRemoteItemsAndMultipleSelectionsDoNotOfferOpenWith() {
+        assertFalse(
+            SelectionToolbarAction.OPEN_WITH in SelectionToolbarModel.forState(
+                isRemote = false,
+                selectionCount = 1,
+                canShare = false,
+                canOpenWith = false,
+            ).overflowActions,
+        )
+        assertFalse(
+            SelectionToolbarAction.OPEN_WITH in SelectionToolbarModel.forState(
+                isRemote = true,
+                selectionCount = 1,
+                canShare = false,
+                canOpenWith = false,
+            ).overflowActions,
+        )
+        assertFalse(
+            SelectionToolbarAction.OPEN_WITH in SelectionToolbarModel.forState(
+                isRemote = false,
+                selectionCount = 2,
+                canShare = true,
+                canOpenWith = false,
+            ).overflowActions,
+        )
+    }
+}

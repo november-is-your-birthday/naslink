@@ -1,0 +1,266 @@
+package com.naslink.util
+
+import android.app.Activity
+import android.content.ClipData
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.StatFs
+import android.os.storage.StorageManager
+import android.os.storage.StorageVolume
+import androidx.core.content.FileProvider
+import com.naslink.R
+import com.naslink.data.model.FileItem
+import com.naslink.data.model.FileSource
+import java.io.File
+
+object FileUtils {
+
+    fun getStorageInfo(path: String = Environment.getExternalStorageDirectory().path): StorageInfo {
+        return try {
+            val stat = StatFs(path)
+            val total = stat.totalBytes
+            val available = stat.availableBytes
+            val used = total - available
+            StorageInfo(total, used, available)
+        } catch (_: Exception) {
+            StorageInfo(0, 0, 0)
+        }
+    }
+
+    fun getStorageDirectories(context: Context? = null): List<StorageDirectory> {
+        if (context != null) {
+            return getStorageVolumes(context)
+                .filter(StorageVolumeInfo::isAvailable)
+                .mapNotNull { volume -> volume.path?.let { StorageDirectory(volume.description, it) } }
+        }
+        val primaryPath = Environment.getExternalStorageDirectory().absolutePath
+        val removablePaths = mutableListOf<String>()
+
+        context?.getExternalFilesDirs(null)?.forEach { appDirectory ->
+            appDirectory?.toStorageRootPath()?.let { removablePaths += it }
+        }
+        removablePaths += discoverStorageRoots(primaryPath)
+
+        return buildStorageDirectories(primaryPath, removablePaths)
+    }
+
+    fun getStorageVolumes(context: Context): List<StorageVolumeInfo> {
+        val primaryPath = Environment.getExternalStorageDirectory().absolutePath
+        val storageManager = context.getSystemService(StorageManager::class.java)
+        val externalRoots = context.getExternalFilesDirs(null)
+            .mapNotNull { it?.toStorageRootPath() }
+        val fallbackPaths = (listOf(primaryPath) + externalRoots + discoverStorageRoots(primaryPath))
+            .map { it.normalizedPath() }
+            .filterNot { it.substringAfterLast("/") in ignoredStorageRootNames }
+
+        val rootsByVolume = context.getExternalFilesDirs(null)
+            .mapNotNull { appDirectory ->
+                appDirectory ?: return@mapNotNull null
+                val volume = storageManager.getStorageVolume(appDirectory) ?: return@mapNotNull null
+                volume.identity(context) to appDirectory.toStorageRootPath()
+            }
+            .filter { it.second != null }
+            .associate { it.first to checkNotNull(it.second) }
+
+        val platformVolumes = storageManager.storageVolumes.map { volume ->
+            val path = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                volume.directory?.absolutePath
+            } else {
+                rootsByVolume[volume.identity(context)] ?: if (volume.isPrimary) primaryPath else null
+            }
+            StorageVolumeInfo(
+                description = volume.getDescription(context),
+                path = path,
+                isPrimary = volume.isPrimary,
+                isRemovable = volume.isRemovable,
+                state = volume.state,
+            )
+        }
+
+        return mergeStorageVolumes(
+            platformVolumes, fallbackPaths, primaryPath,
+            internalLabel = context.getString(R.string.storage_internal),
+            externalLabel = { index -> context.getString(R.string.storage_external_numbered, index) },
+        )
+    }
+
+    fun buildStorageDirectories(
+        primaryExternalPath: String,
+        removableVolumePaths: List<String>,
+    ): List<StorageDirectory> {
+        val primaryPath = primaryExternalPath.normalizedPath()
+        val externalPaths = removableVolumePaths
+            .map { it.normalizedPath() }
+            .filter { it.isNotBlank() }
+            .filterNot { it == primaryPath }
+            .filterNot { it.substringAfterLast("/") in ignoredStorageRootNames }
+            .distinct()
+
+        return buildList {
+            add(StorageDirectory("Internal Storage", primaryPath))
+            externalPaths.forEachIndexed { index, path ->
+                add(
+                    StorageDirectory(
+                        name = if (index == 0) "External Storage" else "External Storage ${index + 1}",
+                        path = path,
+                    )
+                )
+            }
+        }
+    }
+
+    fun getCommonDirectories(): List<CommonDirectory> = listOf(
+        CommonDirectory(R.string.storage_internal, Environment.getExternalStorageDirectory().absolutePath, isPrimary = true),
+        CommonDirectory(R.string.home_downloads, Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath),
+        CommonDirectory(R.string.filter_documents, Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS).absolutePath),
+        CommonDirectory(R.string.home_pictures, Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES).absolutePath),
+        CommonDirectory(R.string.home_music, Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC).absolutePath),
+        CommonDirectory(R.string.home_videos, Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES).absolutePath),
+        CommonDirectory(R.string.home_camera_folder, Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).absolutePath),
+    )
+
+    fun createOpenFileIntent(context: Context, file: FileItem): Result<Intent> = runCatching {
+        require(file.source == FileSource.LOCAL || file.source == FileSource.SAF) {
+            "Only files stored on this device can be opened"
+        }
+        val uri = if (file.source == FileSource.SAF) {
+            Uri.parse(file.path)
+        } else {
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                File(file.path),
+            )
+        }
+        Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, file.mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (file.source == FileSource.LOCAL && File(file.path).canWrite()) {
+                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            }
+        }
+    }
+
+    fun openFile(context: Context, file: FileItem): Result<Unit> =
+        createOpenFileIntent(context, file).mapCatching { intent ->
+            if (context !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        }
+
+    fun createOpenWithIntent(context: Context, file: FileItem): Result<Intent> =
+        createOpenFileIntent(context, file).map { target ->
+            Intent.createChooser(target, context.getString(R.string.action_open_with))
+        }
+
+    fun createRemotePlaybackIntent(uri: Uri, file: FileItem): Intent {
+        require(file.source == FileSource.WEBDAV && !file.isDirectory) {
+            "Direct opening requires a WebDAV file"
+        }
+        return Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, file.mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newRawUri(file.name, uri)
+        }
+    }
+
+    fun openFileWith(context: Context, file: FileItem): Result<Unit> =
+        createOpenWithIntent(context, file).mapCatching { chooser ->
+            if (context !is Activity) chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(chooser)
+        }
+
+    fun shareFile(context: Context, file: FileItem) {
+        shareFiles(context, listOf(file)).getOrThrow()
+    }
+
+    fun createShareIntent(context: Context, files: List<FileItem>): Result<Intent> = runCatching {
+        val plan = requireNotNull(ShareIntentPlan.forFiles(files)) {
+            "Select files stored on this device to share"
+        }
+        val uris = files.map { file ->
+            if (file.source == FileSource.SAF) {
+                Uri.parse(file.path)
+            } else {
+                FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    File(file.path),
+                )
+            }
+        }
+        Intent(
+            if (plan.kind == ShareIntentKind.SINGLE) {
+                Intent.ACTION_SEND
+            } else {
+                Intent.ACTION_SEND_MULTIPLE
+            }
+        ).apply {
+            type = plan.mimeType
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newUri(
+                context.contentResolver,
+                files.first().name,
+                uris.first(),
+            ).also { clip ->
+                uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
+            }
+            if (plan.kind == ShareIntentKind.SINGLE) {
+                putExtra(Intent.EXTRA_STREAM, uris.single())
+            } else {
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            }
+        }
+    }
+
+    fun shareFiles(context: Context, files: List<FileItem>): Result<Unit> =
+        createShareIntent(context, files).mapCatching { intent ->
+            val chooser = Intent.createChooser(intent, context.getString(R.string.action_share))
+            if (context !is Activity) chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(chooser)
+        }
+
+    private fun discoverStorageRoots(primaryPath: String): List<String> =
+        runCatching {
+            File("/storage").listFiles()
+                ?.filter { it.isDirectory && it.canRead() }
+                ?.map { it.absolutePath }
+                ?.filterNot { it.normalizedPath() == primaryPath.normalizedPath() }
+                ?: emptyList()
+        }.getOrElse { emptyList() }
+
+    private fun File.toStorageRootPath(): String? {
+        val marker = "${File.separator}Android${File.separator}data"
+        val markerIndex = absolutePath.indexOf(marker)
+        return if (markerIndex > 0) absolutePath.substring(0, markerIndex) else null
+    }
+
+    private fun StorageVolume.identity(context: Context): String =
+        listOf(isPrimary.toString(), uuid.orEmpty(), getDescription(context)).joinToString(":")
+
+    private fun String.normalizedPath(): String =
+        trim().trimEnd('/').ifBlank { "/" }
+
+    private val ignoredStorageRootNames = setOf("emulated", "self")
+}
+
+data class StorageInfo(
+    val total: Long,
+    val used: Long,
+    val available: Long,
+) {
+    val usedPercentage: Float get() = if (total > 0) used.toFloat() / total.toFloat() else 0f
+}
+
+data class StorageDirectory(
+    val name: String,
+    val path: String,
+)
+
+data class CommonDirectory(
+    @androidx.annotation.StringRes val labelRes: Int,
+    val path: String,
+    val isPrimary: Boolean = false,
+)

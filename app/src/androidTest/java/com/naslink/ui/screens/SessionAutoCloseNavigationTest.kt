@@ -1,0 +1,194 @@
+package com.naslink.ui.screens
+
+import android.app.Application
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasScrollToIndexAction
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToNode
+import androidx.test.core.app.ApplicationProvider
+import com.naslink.data.local.PreferencesManager
+import com.naslink.data.model.SessionAutoCloseTimeout
+import com.naslink.viewmodel.FileBrowserViewModel
+import com.naslink.app.NasLinkApp
+import com.naslink.R
+import com.naslink.ui.text.UiText
+import kotlinx.coroutines.CompletableDeferred
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import java.io.File
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+
+class SessionAutoCloseNavigationTest {
+
+    @get:Rule
+    val composeTestRule = createComposeRule()
+
+    private lateinit var application: Application
+    private lateinit var preferences: PreferencesManager
+    private lateinit var root: File
+    private lateinit var returningRoot: File
+
+    @Before
+    fun setUp() {
+        application = ApplicationProvider.getApplicationContext()
+        preferences = PreferencesManager(application)
+        runBlocking {
+            preferences.setAutoCloseSessions(true)
+            preferences.setSessionAutoCloseTimeout(SessionAutoCloseTimeout.FIVE_MINUTES)
+        }
+        root = File(application.cacheDir, "session-auto-close-navigation-test").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        returningRoot = File(application.cacheDir, "session-auto-close-returning-test").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+    }
+
+    @After
+    fun tearDown() {
+        root.deleteRecursively()
+        returningRoot.deleteRecursively()
+        runBlocking {
+            preferences.setAutoCloseSessions(false)
+            preferences.setSessionAutoCloseTimeout(SessionAutoCloseTimeout.FIFTEEN_MINUTES)
+        }
+    }
+
+    @Test
+    fun automaticClosureReturnsAnOpenBrowserToHome() {
+        val viewModel = FileBrowserViewModel(application)
+        composeTestRule.setContent {
+            MaterialTheme {
+                AppNavigation(
+                    viewModel = viewModel,
+                    hasAllFilesAccess = true,
+                    onRequestAllFilesAccess = {},
+                )
+            }
+        }
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.autoCloseSessions.value
+        }
+        composeTestRule.runOnIdle { viewModel.openLocalRoot(root.absolutePath) }
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.sessions.value.size == 1 && !viewModel.browseState.value.isLoading
+        }
+        composeTestRule.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(root.name))
+        composeTestRule.onNodeWithText(root.name).assertIsDisplayed().performClick()
+        composeTestRule.onNodeWithContentDescription("Back").assertIsDisplayed()
+        val previousGeneration = viewModel.sessionClosureGeneration.value
+
+        composeTestRule.runOnIdle {
+            viewModel.onAppBackgrounded(nowMillis = 1_000L)
+            viewModel.onAppForegrounded(
+                nowMillis = 1_000L + SessionAutoCloseTimeout.FIVE_MINUTES.durationMillis,
+            )
+        }
+
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.sessionClosureGeneration.value == previousGeneration + 1L
+        }
+        composeTestRule.onNodeWithText("NasLink").assertIsDisplayed()
+        composeTestRule.onNodeWithContentDescription("Settings").assertIsDisplayed()
+    }
+
+    @Test
+    fun sharedDuplicateOperationDrainsDeferredSessionsAndReturnsHome() {
+        val viewModel = FileBrowserViewModel(application)
+        val operations = (application as NasLinkApp).transfers
+        val release = CompletableDeferred<Unit>()
+        composeTestRule.setContent {
+            MaterialTheme { AppNavigation(viewModel, true, {}) }
+        }
+        composeTestRule.waitUntil(10_000) {
+            viewModel.autoCloseSessions.value && viewModel.sessionAutoCloseTimeout.value == SessionAutoCloseTimeout.FIVE_MINUTES
+        }
+        composeTestRule.runOnIdle { viewModel.openLocalRoot(root.absolutePath) }
+        composeTestRule.waitUntil(10_000) { viewModel.sessions.value.size == 1 && !viewModel.browseState.value.isLoading }
+        composeTestRule.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(root.name))
+        composeTestRule.onNodeWithText(root.name).performClick()
+        composeTestRule.onNodeWithContentDescription("More").performClick()
+        composeTestRule.onNodeWithText("Find duplicates").performClick()
+        composeTestRule.onNodeWithText("Scan folder").assertIsDisplayed()
+        val originalGeneration = viewModel.sessionClosureGeneration.value
+        try {
+            composeTestRule.runOnIdle {
+                assertTrue(operations.launch(UiText.Resource(R.string.duplicates_removing), onFailure = {}, onFinished = {}) { release.await() })
+                viewModel.onAppBackgrounded(1_000L)
+                viewModel.onAppForegrounded(1_000L + SessionAutoCloseTimeout.FIVE_MINUTES.durationMillis)
+                assertEquals(1, viewModel.sessions.value.size)
+            }
+            composeTestRule.runOnIdle { release.complete(Unit) }
+            composeTestRule.waitUntil(10_000) {
+                viewModel.sessions.value.isEmpty() && viewModel.sessionClosureGeneration.value == originalGeneration + 1
+            }
+            composeTestRule.onNodeWithContentDescription("Settings").assertIsDisplayed()
+            composeTestRule.onNodeWithText("Scan folder").assertDoesNotExist()
+            composeTestRule.runOnIdle { viewModel.openLocalRoot(returningRoot.path) }
+            composeTestRule.waitUntil(10_000) { viewModel.sessions.value.size == 1 && !viewModel.browseState.value.isLoading }
+            composeTestRule.runOnIdle { viewModel.createFile("after-timeout.txt") }
+            composeTestRule.waitUntil(10_000) { returningRoot.resolve("after-timeout.txt").exists() }
+            assertEquals(returningRoot.path, viewModel.sessions.value.single().rootPath)
+        } finally {
+            release.complete(Unit)
+        }
+    }
+
+    @Test
+    fun sessionCreatedByReturningPickerResultRemainsOpen() {
+        val viewModel = FileBrowserViewModel(application)
+        composeTestRule.setContent {
+            MaterialTheme {
+                AppNavigation(
+                    viewModel = viewModel,
+                    hasAllFilesAccess = true,
+                    onRequestAllFilesAccess = {},
+                )
+            }
+        }
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.autoCloseSessions.value
+        }
+        composeTestRule.runOnIdle { viewModel.openLocalRoot(root.absolutePath) }
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.sessions.value.size == 1 && !viewModel.browseState.value.isLoading
+        }
+        composeTestRule.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(root.name))
+        composeTestRule.onNodeWithText(root.name).assertIsDisplayed().performClick()
+        composeTestRule.onNodeWithContentDescription("Back").assertIsDisplayed()
+        val previousGeneration = viewModel.sessionClosureGeneration.value
+
+        composeTestRule.runOnIdle {
+            viewModel.onAppBackgrounded(nowMillis = 1_000L)
+            viewModel.openLocalRoot(returningRoot.absolutePath)
+        }
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.sessions.value.size == 2 &&
+                viewModel.activeSession.value?.rootPath == returningRoot.absolutePath &&
+                !viewModel.browseState.value.isLoading
+        }
+        composeTestRule.runOnIdle {
+            viewModel.onAppForegrounded(
+                nowMillis = 1_000L + SessionAutoCloseTimeout.FIVE_MINUTES.durationMillis,
+            )
+        }
+
+        composeTestRule.waitUntil(timeoutMillis = 10_000) {
+            viewModel.sessionClosureGeneration.value == previousGeneration + 1L &&
+                viewModel.sessions.value.singleOrNull()?.rootPath == returningRoot.absolutePath
+        }
+        composeTestRule.onNodeWithContentDescription("Back").assertIsDisplayed()
+        composeTestRule.onNodeWithText("NasLink").assertDoesNotExist()
+    }
+}

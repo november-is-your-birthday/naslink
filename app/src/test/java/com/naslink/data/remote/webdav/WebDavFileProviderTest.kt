@@ -1,0 +1,554 @@
+package com.naslink.data.remote.webdav
+
+import com.naslink.data.model.ConnectionProtocol
+import com.naslink.data.model.RemoteConnection
+import com.naslink.data.archive.ArchiveService
+import com.naslink.data.repository.DownloadProgress
+import com.naslink.data.repository.FileDownloader
+import com.naslink.data.repository.StreamTransferProgress
+import com.naslink.data.repository.TransferCancellation
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import okhttp3.Credentials
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import okio.Buffer
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.net.InetAddress
+import java.net.URI
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+class WebDavFileProviderTest {
+
+    @get:Rule
+    val temp = TemporaryFolder()
+
+    private val servers = mutableListOf<LocalWebDavServer>()
+
+    @After
+    fun tearDown() {
+        servers.forEach { it.stop() }
+    }
+
+    @Test
+    fun httpsSupportsCustomPorts() {
+        val connection = RemoteConnection(
+            name = "Secure WebDAV",
+            protocol = ConnectionProtocol.WEBDAV,
+            host = "files.example.com",
+            port = 8443,
+            useTls = true,
+        )
+
+        assertEquals("https://files.example.com:8443", webDavBaseUrl(connection))
+    }
+
+    @Test
+    fun httpMustBeSelectedExplicitly() {
+        val connection = RemoteConnection(
+            name = "Local WebDAV",
+            protocol = ConnectionProtocol.WEBDAV,
+            host = "192.168.1.5",
+            port = 8080,
+            useTls = false,
+        )
+
+        assertEquals("http://192.168.1.5:8080", webDavBaseUrl(connection))
+    }
+
+    @Test
+    fun listFilesFromPropfindResponse() = runBlocking {
+        val server = startServer()
+        Files.write(server.root.resolve("hello.txt"), "hello".toByteArray())
+        val provider = createProvider(server.port)
+
+        val files = provider.listFiles("/").getOrThrow()
+
+        assertEquals(listOf("hello.txt"), files.map { it.name })
+    }
+
+    @Test
+    fun treatsTrailingSlashHrefAsDirectoryWhenResourceTypeIsMissing() = runBlocking {
+        val server = startServer(omitCollectionResourceType = true)
+        Files.createDirectory(server.root.resolve("folder"))
+        val provider = createProvider(server.port)
+
+        val files = provider.listFiles("/").getOrThrow()
+
+        assertEquals(listOf("folder"), files.map { it.name })
+        assertTrue(files.single().isDirectory)
+    }
+
+    @Test
+    fun outputStreamConnectsAndUploadsFile() = runBlocking {
+        val server = startServer()
+        val provider = createProvider(server.port)
+
+        provider.getOutputStream("/uploaded.txt").getOrThrow().use { stream ->
+            stream.write("uploaded".toByteArray())
+        }
+
+        assertTrue(Files.exists(server.root.resolve("uploaded.txt")))
+        assertEquals("uploaded", String(Files.readAllBytes(server.root.resolve("uploaded.txt"))))
+    }
+
+    @Test
+    fun cancelledOutputStreamDoesNotUploadItsTemporaryFile() = runBlocking {
+        val server = startServer()
+        val provider = createProvider(server.port)
+        val token = TransferCancellation()
+
+        val failure = runCatching {
+            withContext(token.contextElement()) {
+                provider.getOutputStream("/cancelled.txt").getOrThrow().use { stream ->
+                    stream.write("partial".toByteArray())
+                    token.cancel()
+                }
+            }
+        }.exceptionOrNull()
+
+        assertTrue(failure is CancellationException)
+        assertFalse(Files.exists(server.root.resolve("cancelled.txt")))
+        assertTrue(temp.root.listFiles().orEmpty().none { it.name.startsWith("naslink-webdav-") })
+    }
+
+    @Test
+    fun cancellingCompressionAbortsTheFinalUploadAndRemovesTheArchive() {
+        val uploadReceived = CountDownLatch(1)
+        val releaseResponse = CountDownLatch(1)
+        val server = startServer(afterPut = { path ->
+            if (path.fileName.toString() == "bundle.zip" && Files.size(path) > 0) {
+                uploadReceived.countDown()
+                check(releaseResponse.await(10, TimeUnit.SECONDS)) { "Upload response was not released" }
+            }
+        })
+        Files.write(server.root.resolve("source.txt"), "source".toByteArray())
+        val provider = createProvider(server.port)
+        val token = TransferCancellation()
+        val worker = Executors.newSingleThreadExecutor()
+        val finished = CountDownLatch(1)
+        var failure: Throwable? = null
+        try {
+            worker.submit {
+                try {
+                    runBlocking(token.contextElement()) {
+                        ArchiveService.createZip(
+                            provider,
+                            listOf(provider.getFileInfo("/source.txt").getOrThrow()),
+                            "/",
+                            "bundle.zip",
+                        ).getOrThrow()
+                    }
+                } catch (error: Throwable) {
+                    failure = error
+                } finally {
+                    finished.countDown()
+                }
+            }
+            assertTrue("Final upload did not start", uploadReceived.await(5, TimeUnit.SECONDS))
+            token.cancel()
+            assertTrue("Cancel did not interrupt the final upload", finished.await(2, TimeUnit.SECONDS))
+            assertTrue("Expected cancellation, got $failure", failure is CancellationException)
+            assertFalse(Files.exists(server.root.resolve("bundle.zip")))
+            assertEquals("source", String(Files.readAllBytes(server.root.resolve("source.txt"))))
+            assertTrue(temp.root.listFiles().orEmpty().none { it.name.startsWith("naslink-webdav-") })
+        } finally {
+            releaseResponse.countDown()
+            worker.shutdown()
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test
+    fun writeStreamReportsHttpRequestBodyProgressWithoutSpooling() = runBlocking {
+        val server = startServer()
+        val provider = createProvider(server.port)
+        val payload = ByteArray(2 * 64 * 1024 + 17) { index -> (index % 251).toByte() }
+        val progress = mutableListOf<StreamTransferProgress>()
+
+        provider.writeStream(
+            path = "/streamed.bin",
+            input = ByteArrayInputStream(payload),
+            sourcePath = "streamed.bin",
+            totalBytes = payload.size.toLong(),
+            onProgress = progress::add,
+        ).getOrThrow()
+
+        assertTrue(Files.readAllBytes(server.root.resolve("streamed.bin")).contentEquals(payload))
+        assertTrue(progress.size >= 3)
+        assertTrue(progress.all { it.path == "streamed.bin" })
+        assertTrue(progress.all { it.totalBytes == payload.size.toLong() })
+        assertEquals(payload.size.toLong(), progress.last().bytesTransferred)
+        assertTrue(temp.root.listFiles().orEmpty().none { it.name.startsWith("naslink-webdav-") })
+    }
+
+    @Test
+    fun fileDownloaderSavesFileToLocalDirectory() = runBlocking {
+        val server = startServer()
+        val payload = ByteArray(2 * 64 * 1024 + 17) { index -> ('a'.code + index % 26).toByte() }
+        Files.write(server.root.resolve("remote.txt"), payload)
+        val provider = createProvider(server.port)
+        val destination = temp.newFolder("downloads").toPath()
+        val item = provider.listFiles("/").getOrThrow().single()
+        val progress = mutableListOf<DownloadProgress>()
+
+        val result = FileDownloader.download(
+            provider = provider,
+            items = listOf(item),
+            destinationDirectory = destination.toFile(),
+            onProgress = progress::add,
+        ).getOrThrow()
+
+        assertEquals(1, result.downloadedFiles)
+        assertTrue(Files.readAllBytes(destination.resolve("remote.txt")).contentEquals(payload))
+        val streamEvents = progress.mapNotNull { it.stream }
+        assertTrue(streamEvents.size >= 3)
+        assertTrue(streamEvents.all { it.path == "/remote.txt" })
+        assertTrue(streamEvents.all { it.totalBytes == payload.size.toLong() })
+        assertEquals(payload.size.toLong(), streamEvents.last().bytesTransferred)
+        assertEquals(1, progress.last().completedRequestedItems)
+        assertEquals(1, progress.last().totalRequestedItems)
+    }
+
+    @Test
+    fun copyMoveAndDeleteFile() = runBlocking {
+        val server = startServer()
+        Files.createDirectory(server.root.resolve("target"))
+        Files.createDirectory(server.root.resolve("moved"))
+        Files.write(server.root.resolve("source.txt"), "source".toByteArray())
+        val provider = createProvider(server.port)
+
+        provider.copy("/source.txt", "/target").getOrThrow()
+        provider.move("/target/source.txt", "/moved").getOrThrow()
+        provider.delete("/source.txt").getOrThrow()
+
+        assertFalse(Files.exists(server.root.resolve("source.txt")))
+        assertEquals("source", String(Files.readAllBytes(server.root.resolve("moved/source.txt"))))
+    }
+
+    @Test
+    fun handlesFileNamesWithSpaces() = runBlocking {
+        val server = startServer()
+        val provider = createProvider(server.port)
+
+        provider.getOutputStream("/space file.txt").getOrThrow().use { stream ->
+            stream.write("space".toByteArray())
+        }
+
+        val files = provider.listFiles("/").getOrThrow()
+
+        assertEquals(listOf("space file.txt"), files.map { it.name })
+        assertEquals("space", String(Files.readAllBytes(server.root.resolve("space file.txt"))))
+    }
+
+    @Test
+    fun preparesIndependentAuthenticatedPlaybackSourceWithEncodedPath() = runBlocking {
+        val server = MockWebServer()
+        val payload = ByteArray(10) { it.toByte() }
+        server.dispatcher = rangeDispatcher(payload)
+        server.start(InetAddress.getByName("127.0.0.1"), 0)
+        try {
+            val prepared = createProvider(server.port).createPlaybackSource("/space file.mp3").getOrThrow()
+
+            assertEquals(10L, prepared.metadata.size)
+            assertTrue(prepared.source.read(3, 4).getOrThrow().contentEquals(byteArrayOf(3, 4, 5, 6)))
+            repeat(2) {
+                val request = server.takeRequest()
+                assertEquals("/space%20file.mp3", request.requestUrl?.encodedPath)
+                assertEquals(Credentials.basic(USERNAME, PASSWORD), request.getHeader("Authorization"))
+            }
+            prepared.source.close()
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun rejectsPlaybackSourceWhenServerIgnoresRanges() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(200).setBody("complete file"))
+        server.start(InetAddress.getByName("127.0.0.1"), 0)
+        try {
+            assertTrue(createProvider(server.port).createPlaybackSource("/song.mp3").isFailure)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun outputStreamSpoolsLargeFilesWithoutByteArrayBuffering() = runBlocking {
+        val server = startServer()
+        val provider = createProvider(server.port)
+        val payload = ByteArray(LARGE_TRANSFER_BYTES) { (it % 251).toByte() }
+
+        val output = provider.getOutputStream("/large.bin").getOrThrow()
+        assertFalse(output is ByteArrayOutputStream)
+        output.use { it.write(payload) }
+
+        assertTrue(Files.readAllBytes(server.root.resolve("large.bin")).contentEquals(payload))
+        assertTrue(temp.root.listFiles().orEmpty().none { it.name.startsWith("naslink-webdav-") })
+    }
+
+    private fun createProvider(port: Int): WebDavFileProvider =
+        WebDavFileProvider(
+            RemoteConnection(
+                name = "Local test WebDAV",
+                protocol = ConnectionProtocol.WEBDAV,
+                host = "127.0.0.1",
+                port = port,
+                username = USERNAME,
+                password = PASSWORD,
+            ),
+            temp.root,
+        )
+
+    private fun startServer(
+        omitCollectionResourceType: Boolean = false,
+        afterPut: (Path) -> Unit = {},
+    ): LocalWebDavServer {
+        val server = LocalWebDavServer(
+            root = temp.newFolder("webdav-root-${servers.size}").toPath(),
+            omitCollectionResourceType = omitCollectionResourceType,
+            afterPut = afterPut,
+        )
+        server.start()
+        servers += server
+        return server
+    }
+
+    private fun rangeDispatcher(payload: ByteArray): Dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+            if (request.getHeader("Authorization") != Credentials.basic(USERNAME, PASSWORD)) {
+                return MockResponse().setResponseCode(401)
+            }
+            val match = Regex("bytes=(\\d+)-(\\d+)").matchEntire(request.getHeader("Range").orEmpty())
+                ?: return MockResponse().setResponseCode(200).setBody(Buffer().write(payload))
+            val start = match.groupValues[1].toInt()
+            val end = minOf(match.groupValues[2].toInt(), payload.lastIndex)
+            return MockResponse()
+                .setResponseCode(206)
+                .setHeader("Content-Range", "bytes $start-$end/${payload.size}")
+                .setBody(Buffer().write(payload, start, end - start + 1))
+        }
+    }
+
+    private class LocalWebDavServer(
+        val root: Path,
+        private val omitCollectionResourceType: Boolean,
+        private val afterPut: (Path) -> Unit,
+    ) {
+        private val server = MockWebServer()
+        val port: Int get() = server.port
+
+        fun start() {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse =
+                    runCatching { handle(request) }
+                        .getOrElse { error -> textResponse(500, error.message ?: "Server error") }
+            }
+            server.start(InetAddress.getByName("127.0.0.1"), 0)
+        }
+
+        fun stop() {
+            server.shutdown()
+        }
+
+        private fun handle(request: RecordedRequest): MockResponse =
+            when (request.method) {
+                "PROPFIND" -> handlePropfind(request)
+                "GET" -> handleGet(request)
+                "PUT" -> handlePut(request)
+                "MKCOL" -> handleMkcol(request)
+                "DELETE" -> handleDelete(request)
+                "COPY" -> handleCopy(request)
+                "MOVE" -> handleMove(request)
+                else -> textResponse(405, "Unsupported method")
+            }
+
+        private fun handlePropfind(request: RecordedRequest): MockResponse {
+            val path = resolve(request.requestUrl!!.encodedPath)
+            if (!Files.exists(path)) return textResponse(404, "Not found")
+
+            val responses = buildList {
+                add(path)
+                if (Files.isDirectory(path)) {
+                    Files.list(path).use { stream ->
+                        stream.sorted().forEach { add(it) }
+                    }
+                }
+            }
+
+            return xmlResponse(
+                207,
+                """
+                <d:multistatus xmlns:d="DAV:">
+                    ${responses.joinToString(separator = "\n") { it.toDavResponse() }}
+                </d:multistatus>
+                """.trimIndent(),
+            )
+        }
+
+        private fun handleGet(request: RecordedRequest): MockResponse {
+            val path = resolve(request.requestUrl!!.encodedPath)
+            if (!Files.isRegularFile(path)) return textResponse(404, "Not found")
+            return MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/octet-stream")
+                .setBody(String(Files.readAllBytes(path)))
+        }
+
+        private fun handlePut(request: RecordedRequest): MockResponse {
+            val path = resolve(request.requestUrl!!.encodedPath)
+            Files.createDirectories(path.parent)
+            Files.write(path, request.body.readByteArray())
+            afterPut(path)
+            return MockResponse().setResponseCode(201)
+        }
+
+        private fun handleMkcol(request: RecordedRequest): MockResponse {
+            Files.createDirectory(resolve(request.requestUrl!!.encodedPath))
+            return MockResponse().setResponseCode(201)
+        }
+
+        private fun handleDelete(request: RecordedRequest): MockResponse {
+            val path = resolve(request.requestUrl!!.encodedPath)
+            if (!Files.exists(path)) return textResponse(404, "Not found")
+            path.deleteRecursively()
+            return MockResponse().setResponseCode(204)
+        }
+
+        private fun handleCopy(request: RecordedRequest): MockResponse {
+            val source = resolve(request.requestUrl!!.encodedPath)
+            val destination = resolveDestination(request)
+            if (Files.isDirectory(source)) {
+                copyDirectory(source, destination)
+            } else {
+                Files.createDirectories(destination.parent)
+                Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING)
+            }
+            return MockResponse().setResponseCode(201)
+        }
+
+        private fun handleMove(request: RecordedRequest): MockResponse {
+            val source = resolve(request.requestUrl!!.encodedPath)
+            val destination = resolveDestination(request)
+            Files.createDirectories(destination.parent)
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING)
+            return MockResponse().setResponseCode(201)
+        }
+
+        private fun resolveDestination(request: RecordedRequest): Path {
+            val destination = request.getHeader("Destination")
+                ?: throw IllegalArgumentException("Missing Destination header")
+            return resolve(URI(destination).rawPath)
+        }
+
+        private fun resolve(rawPath: String): Path {
+            val decoded = URLDecoder.decode(rawPath, Charsets.UTF_8.name())
+            val relative = decoded.trimStart('/')
+            return root.resolve(relative).normalize().also {
+                require(it.startsWith(root)) { "Path escapes WebDAV root" }
+            }
+        }
+
+        private fun Path.toDavResponse(): String {
+            val directory = Files.isDirectory(this)
+            val href = toHref(directory)
+            val modified = DateTimeFormatter.RFC_1123_DATE_TIME.format(
+                Instant.ofEpochMilli(Files.getLastModifiedTime(this).toMillis()).atZone(ZoneOffset.UTC)
+            )
+            val length = if (directory) 0L else Files.size(this)
+            val resourceType = if (directory && !omitCollectionResourceType) "<d:collection />" else ""
+
+            return """
+                <d:response>
+                    <d:href>$href</d:href>
+                    <d:propstat>
+                        <d:prop>
+                            <d:resourcetype>$resourceType</d:resourcetype>
+                            <d:getcontentlength>$length</d:getcontentlength>
+                            <d:getlastmodified>$modified</d:getlastmodified>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                    </d:propstat>
+                </d:response>
+            """.trimIndent()
+        }
+
+        private fun Path.toHref(directory: Boolean): String {
+            val relative = root.relativize(this).joinToString("/")
+            val encoded = relative.split("/")
+                .filter { it.isNotEmpty() }
+                .joinToString("/", prefix = "/") { segment ->
+                    URLEncoder.encode(segment, Charsets.UTF_8.name()).replace("+", "%20")
+                }
+            return when {
+                relative.isEmpty() -> "/"
+                directory -> "$encoded/"
+                else -> encoded
+            }
+        }
+
+        private fun Path.deleteRecursively() {
+            if (Files.isDirectory(this)) {
+                Files.list(this).use { stream ->
+                    stream.forEach { it.deleteRecursively() }
+                }
+            }
+            Files.deleteIfExists(this)
+        }
+
+        private fun copyDirectory(source: Path, destination: Path) {
+            Files.createDirectories(destination)
+            Files.list(source).use { stream ->
+                stream.forEach { child ->
+                    val target = destination.resolve(child.fileName.toString())
+                    if (Files.isDirectory(child)) {
+                        copyDirectory(child, target)
+                    } else {
+                        Files.copy(child, target, StandardCopyOption.REPLACE_EXISTING)
+                    }
+                }
+            }
+        }
+
+        private fun xmlResponse(status: Int, body: String): MockResponse =
+            MockResponse()
+                .setResponseCode(status)
+                .setHeader("Content-Type", "application/xml; charset=utf-8")
+                .setBody(body)
+
+        private fun textResponse(status: Int, body: String): MockResponse =
+            MockResponse()
+                .setResponseCode(status)
+                .setHeader("Content-Type", "text/plain; charset=utf-8")
+                .setBody(body)
+    }
+
+    private companion object {
+        const val USERNAME = "tester"
+        const val PASSWORD = "secret"
+        const val LARGE_TRANSFER_BYTES = 2 * 1024 * 1024
+    }
+}

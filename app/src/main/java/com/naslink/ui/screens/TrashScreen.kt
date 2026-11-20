@@ -1,0 +1,362 @@
+package com.naslink.ui.screens
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import coil.imageLoader
+import coil.memory.MemoryCache
+import com.naslink.R
+import com.naslink.data.model.TrashEntry
+import com.naslink.ui.components.ApkThumbnailLoader
+import com.naslink.ui.components.DeleteConfirmDialog
+import com.naslink.ui.components.DeleteDialogModel
+import com.naslink.ui.components.FileThumbnailOrIcon
+import com.naslink.ui.components.MediaThumbnailLoader
+import com.naslink.ui.components.PdfThumbnailLoader
+import com.naslink.ui.components.fileThumbnailCacheKey
+import com.naslink.ui.text.asString
+import com.naslink.viewmodel.FileBrowserViewModel
+import com.naslink.viewmodel.OperationState
+import java.text.DateFormat
+import java.util.Date
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TrashScreen(
+    viewModel: FileBrowserViewModel,
+    onNavigateBack: () -> Unit,
+) {
+    val state by viewModel.trashState.collectAsState()
+    val operationState by viewModel.operationState.collectAsState()
+    val operationResult by viewModel.lastOperationResult.collectAsState()
+    val snackbarMessage by viewModel.snackbarMessage.collectAsState()
+    val resolvedSnackbarMessage = snackbarMessage?.let { it.asString() }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val runningOperation = operationState as? OperationState.Running
+    val isSelectionMode = state.selectedIds.isNotEmpty()
+    var showPermanentDeleteDialog by remember { mutableStateOf(false) }
+    var showEmptyDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) { viewModel.refreshTrash() }
+    LaunchedEffect(snackbarMessage) {
+        resolvedSnackbarMessage?.let { message ->
+            snackbarHostState.showSnackbar(message)
+            viewModel.clearSnackbar()
+        }
+    }
+
+    BackHandler {
+        if (isSelectionMode) viewModel.clearTrashSelection() else onNavigateBack()
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        if (isSelectionMode) {
+                            pluralStringResource(
+                                R.plurals.items_selected,
+                                state.selectedIds.size,
+                                state.selectedIds.size,
+                            )
+                        } else {
+                            stringResource(R.string.trash_title)
+                        },
+                    )
+                },
+                navigationIcon = {
+                    IconButton(
+                        onClick = {
+                            if (isSelectionMode) viewModel.clearTrashSelection() else onNavigateBack()
+                        },
+                    ) {
+                        Icon(
+                            if (isSelectionMode) Icons.Filled.Close else Icons.AutoMirrored.Filled.ArrowBack,
+                            stringResource(
+                                if (isSelectionMode) R.string.content_desc_clear_selection
+                                else R.string.content_desc_back,
+                            ),
+                        )
+                    }
+                },
+                actions = {
+                    if (isSelectionMode) {
+                        IconButton(
+                            onClick = viewModel::restoreSelectedTrash,
+                            enabled = runningOperation == null,
+                        ) {
+                            Icon(Icons.Filled.Restore, stringResource(R.string.content_desc_restore_selected))
+                        }
+                        IconButton(
+                            onClick = { showPermanentDeleteDialog = true },
+                            enabled = runningOperation == null,
+                        ) {
+                            Icon(
+                                Icons.Filled.DeleteForever,
+                                stringResource(R.string.content_desc_delete_selected_permanently),
+                            )
+                        }
+                    } else if (state.entries.isNotEmpty()) {
+                        TextButton(
+                            onClick = { showEmptyDialog = true },
+                            enabled = runningOperation == null,
+                        ) {
+                            Text(stringResource(R.string.action_empty))
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = if (isSelectionMode) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+                ),
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
+            runningOperation?.let { operation ->
+                OperationProgressContent(operation, onCancel = viewModel::cancelOperation)
+            }
+            if (runningOperation == null) {
+                operationResult?.let { OperationResultContent(it, onDismiss = viewModel::dismissOperationResult) }
+            }
+
+            when {
+                state.isLoading && state.entries.isEmpty() -> {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                }
+
+                state.error != null -> {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(32.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.ErrorOutline,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(48.dp),
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(stringResource(R.string.trash_load_failed), style = MaterialTheme.typography.titleMedium)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                state.error?.asString().orEmpty(),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            TextButton(onClick = viewModel::refreshTrash) {
+                                Text(stringResource(R.string.action_retry))
+                            }
+                        }
+                    }
+                }
+
+                state.entries.isEmpty() -> {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                Icons.Filled.DeleteSweep,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                modifier = Modifier.size(56.dp),
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(stringResource(R.string.trash_empty_state), style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                stringResource(R.string.trash_empty_state_description),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                else -> {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(state.entries, key = TrashEntry::id) { entry ->
+                            TrashEntryRow(
+                                entry = entry,
+                                selected = entry.id in state.selectedIds,
+                                enabled = runningOperation == null,
+                                onToggle = { viewModel.toggleTrashSelection(entry.id) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showPermanentDeleteDialog) {
+        val selected = state.entries.filter { it.id in state.selectedIds }
+        DeleteConfirmDialog(
+            model = DeleteDialogModel.permanent(
+                count = selected.size,
+                fileName = selected.singleOrNull()?.displayName.orEmpty(),
+            ),
+            onDismiss = { showPermanentDeleteDialog = false },
+            onConfirm = {
+                showPermanentDeleteDialog = false
+                viewModel.deleteSelectedTrashPermanently()
+            },
+        )
+    }
+
+    if (showEmptyDialog) {
+        AlertDialog(
+            onDismissRequest = { showEmptyDialog = false },
+            title = { Text(stringResource(R.string.trash_empty_title)) },
+            text = { Text(stringResource(R.string.trash_empty_message)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showEmptyDialog = false
+                        viewModel.emptyTrash()
+                    },
+                ) { Text(stringResource(R.string.action_empty_trash)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEmptyDialog = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+    }
+}
+
+@Composable
+internal fun TrashEntryRow(
+    entry: TrashEntry,
+    selected: Boolean,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+) {
+    val preview = remember(entry) { entry.previewFile() }
+    val imageLoader = LocalContext.current.imageLoader
+    DisposableEffect(preview) {
+        onDispose {
+            MediaThumbnailLoader.invalidate(preview.path)
+            PdfThumbnailLoader.invalidate(preview.path)
+            ApkThumbnailLoader.invalidate(preview.path)
+            imageLoader.memoryCache?.remove(MemoryCache.Key(fileThumbnailCacheKey(preview)))
+        }
+    }
+    val selectionContentDescription = stringResource(
+        if (selected) R.string.content_desc_deselect_named else R.string.content_desc_select_named,
+        entry.displayName,
+    )
+    val deletedAt = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+        .format(Date(entry.deletedAt))
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onToggle),
+        colors = CardDefaults.cardColors(
+            containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(
+                checked = selected,
+                onCheckedChange = { onToggle() },
+                enabled = enabled,
+                modifier = Modifier.semantics {
+                    contentDescription = selectionContentDescription
+                },
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            FileThumbnailOrIcon(file = preview, iconSize = 32.dp)
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    entry.displayName,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    entry.originalPath,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    stringResource(R.string.trash_deleted_at, deletedAt),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}

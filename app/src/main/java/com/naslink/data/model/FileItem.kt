@@ -1,0 +1,170 @@
+package com.naslink.data.model
+
+import android.webkit.MimeTypeMap
+import androidx.annotation.StringRes
+import com.naslink.R
+import com.naslink.ui.text.UiText
+import java.text.DecimalFormat
+import java.util.Date
+
+data class FileItem(
+    val name: String,
+    val path: String,
+    val isDirectory: Boolean,
+    val size: Long = 0,
+    val lastModified: Date = Date(),
+    val isHidden: Boolean = false,
+    val permissions: String? = null,
+    val owner: String? = null,
+    val source: FileSource = FileSource.LOCAL,
+) {
+    val extension: String
+        get() = if (isDirectory) "" else name.substringAfterLast('.', "")
+
+    val mimeType: String
+        get() = if (isDirectory) "inode/directory"
+        else mimeTypeFromExtension(extension)
+
+    val isImage: Boolean
+        get() = mimeType.startsWith("image/")
+
+    val isVideo: Boolean
+        get() = mimeType.startsWith("video/")
+
+    val isAudio: Boolean
+        get() = mimeType.startsWith("audio/")
+
+    val isText: Boolean
+        get() = mimeType.startsWith("text/") || extension.lowercase() in textExtensions
+
+    val isArchive: Boolean
+        get() = extension.lowercase() in archiveExtensions
+
+    val isApk: Boolean
+        get() = extension.equals("apk", ignoreCase = true)
+
+    val isPdf: Boolean
+        get() = !isDirectory && extension.equals("pdf", ignoreCase = true)
+
+    val isOfficeDocument: Boolean
+        get() = !isDirectory && extension.lowercase() in setOf("docx", "pptx", "xlsx")
+
+    val usesLocalImageThumbnail: Boolean
+        get() = source == FileSource.LOCAL && isImage
+
+    val formattedSize: String
+        get() = formatFileSize(size)
+
+    companion object {
+        private val textExtensions = setOf(
+            "txt", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf",
+            "properties", "md", "rst", "log", "csv", "tsv", "sh", "bash",
+            "zsh", "fish", "py", "kt", "java", "js", "ts", "html", "css",
+            "sql", "gradle", "kts",
+        )
+
+        private val archiveExtensions = setOf(
+            "zip", "tar", "tgz", "gz", "tbz2", "bz2", "xz", "7z", "rar", "zst",
+        )
+
+        private val mimeTypeOverrides = mapOf(
+            "apk" to "application/vnd.android.package-archive",
+            "avif" to "image/avif",
+            // Listed explicitly rather than left to MimeTypeMap, which does not reliably
+            // know every format on every Android version. A missing entry does not fall back
+            // to octet-stream quietly for these: it makes `isImage` false, which hides the
+            // file from the image viewer and the thumbnail path entirely.
+            "bmp" to "image/bmp",
+            "gif" to "image/gif",
+            "heic" to "image/heic",
+            "heif" to "image/heif",
+            "jpg" to "image/jpeg",
+            "jpeg" to "image/jpeg",
+            "m4a" to "audio/mp4",
+            "mp3" to "audio/mpeg",
+            "mp4" to "video/mp4",
+            "png" to "image/png",
+            "webp" to "image/webp",
+        )
+
+        private fun mimeTypeFromExtension(extension: String): String {
+            val normalizedExtension = extension.lowercase()
+            return mimeTypeOverrides[normalizedExtension]
+                ?: runCatching {
+                    MimeTypeMap.getSingleton().getMimeTypeFromExtension(normalizedExtension)
+                }.getOrNull()
+                ?: "application/octet-stream"
+        }
+
+        fun formatFileSize(size: Long): String {
+            if (size <= 0) return "0 B"
+            val units = arrayOf("B", "KB", "MB", "GB", "TB")
+            val digitGroups = (Math.log10(size.toDouble()) / Math.log10(1024.0)).toInt()
+            val df = DecimalFormat("#,##0.#")
+            return "${df.format(size / Math.pow(1024.0, digitGroups.toDouble()))} ${units[digitGroups]}"
+        }
+    }
+}
+
+enum class FileSource {
+    LOCAL,
+    ROOT,
+    SAF,
+    SFTP,
+    FTP,
+    SMB,
+    WEBDAV,
+}
+
+val FileSource.isNetwork: Boolean
+    get() = this == FileSource.SFTP ||
+        this == FileSource.FTP ||
+        this == FileSource.SMB ||
+        this == FileSource.WEBDAV
+
+enum class SortBy(@StringRes val labelRes: Int) {
+    NAME(R.string.browser_sort_name),
+    SIZE(R.string.browser_sort_size),
+    DATE(R.string.browser_sort_date),
+    TYPE(R.string.browser_sort_type),
+}
+
+enum class SortOrder {
+    ASCENDING,
+    DESCENDING,
+}
+
+data class BrowseState(
+    val currentPath: String = "/",
+    val files: List<FileItem> = emptyList(),
+    val isLoading: Boolean = false,
+    val error: UiText? = null,
+    val selectedFiles: Set<String> = emptySet(),
+    val sortBy: SortBy = SortBy.NAME,
+    val sortOrder: SortOrder = SortOrder.ASCENDING,
+    val showHidden: Boolean = false,
+    val viewMode: ViewMode = ViewMode.LIST,
+    val source: FileSource = FileSource.LOCAL,
+    val searchQuery: String = "",
+    val fileTypeFilter: FileTypeFilter = FileTypeFilter.ALL,
+) {
+    val visibleFiles: List<FileItem>
+        get() {
+            val query = searchQuery.trim()
+            return files.filter { file ->
+                (query.isEmpty() || file.name.contains(query, ignoreCase = true)) && fileTypeFilter.matches(file)
+            }
+        }
+
+    val reconciledSelection: Set<String>
+        get() {
+            val visiblePaths = visibleFiles.mapTo(mutableSetOf()) { it.path }
+            return selectedFiles.intersect(visiblePaths)
+        }
+}
+
+enum class ViewMode(@StringRes val labelRes: Int) {
+    LIST(R.string.view_mode_list),
+    COMPACT(R.string.view_mode_compact_list),
+    GRID(R.string.view_mode_grid),
+}

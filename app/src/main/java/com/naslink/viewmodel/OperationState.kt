@@ -1,0 +1,29 @@
+package com.naslink.viewmodel
+
+import com.naslink.data.model.TrashEntry
+import com.naslink.ui.text.UiText
+
+sealed interface OperationState {
+    data object Idle : OperationState
+
+    data class Running(
+        val progress: TransferProgress,
+        val id: Long = 0,
+        val cancellable: Boolean = false,
+        val cancelling: Boolean = false,
+    ) : OperationState {
+        val label: UiText
+            get() = progress.label
+    }
+}
+
+enum class OperationOutcome { COMPLETED, FAILED, CANCELLED }
+
+data class OperationResult(val progress: TransferProgress, val outcome: OperationOutcome)
+
+data class TrashState(
+    val entries: List<TrashEntry> = emptyList(),
+    val selectedIds: Set<String> = emptySet(),
+    val isLoading: Boolean = false,
+    val error: UiText? = null,
+)

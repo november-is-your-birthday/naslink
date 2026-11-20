@@ -1,0 +1,71 @@
+# Release Process
+
+NasLink has two coordinated distribution paths:
+
+- GitHub releases and GitHub Pages host APKs signed with the project's release key.
+- The current F-Droid recipe rebuilds the source, verifies it against the upstream APK through the `Binaries` directive, checks the expected developer signing key with `AllowedAPKSigningKeys`, and publishes the verified developer-signed APK.
+
+Keep the release inputs aligned. Do not commit keystores, generated APKs, local signing files, or F-Droid build output. F-Droid's reproducible-build flow is documented at [f-droid.org/docs/Reproducible_Builds](https://f-droid.org/docs/Reproducible_Builds/).
+
+## GitHub Actions Secrets
+
+Configure these repository secrets before publishing a GitHub release:
+
+- `ANDROID_KEYSTORE_BASE64`: Base64-encoded release keystore file.
+- `ANDROID_KEYSTORE_PASSWORD`: Keystore password.
+- `ANDROID_KEY_ALIAS`: Release key alias.
+- `ANDROID_KEY_PASSWORD`: Release key password.
+
+Example keystore encoding:
+
+```bash
+base64 -w 0 naslink-release.keystore
+```
+
+The release workflow decodes the keystore into the runner temp directory and passes its path through `ANDROID_KEYSTORE_PATH`. Gradle only uses the release signing config when all four signing values are present.
+
+## CI
+
+Every push and pull request to `master` runs:
+
+```bash
+./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease --stacktrace
+```
+
+The CI workflow uploads debug APKs and verification reports as short-lived workflow artifacts. It does not publish user-facing releases.
+
+## GitHub Release And Pages
+
+Before tagging, confirm the version code and name in `app/build.gradle.kts`, add identical changelogs under `fastlane/metadata/android/en-US/changelogs/` and `metadata/en-US/changelogs/`, write public release notes in `docs/releases/<versionName>.md`, and run the complete clean local and connected-device gates. NasLink 1.12.0 uses version code 20, so both release changelogs are named `20.txt`.
+
+Create an annotated version tag that matches `versionName` in `app/build.gradle.kts`:
+
+```bash
+git tag -a v1.12.0 -m "NasLink 1.12.0"
+git push origin v1.12.0
+```
+
+The release workflow will:
+
+- Verify the tag matches `versionName`.
+- Require all signing secrets.
+- Run unit tests, lint, and `assembleRelease`.
+- Check each APK's application ID, version code, version name, and release-key fingerprint before publication.
+- Upload signed APKs and `SHA256SUMS.txt` to the GitHub Release.
+- Deploy a GitHub Pages site containing the latest APK download, checksums, and `latest.json`.
+
+GitHub Pages must be configured to use GitHub Actions as the deployment source.
+
+## F-Droid Metadata
+
+The F-Droid recipe is `metadata/com.naslink.yml`.
+
+Important constraints:
+
+- `Builds.commit` should be the full commit hash for the source revision being built.
+- `AutoUpdateMode: Version` with `UpdateCheckMode: Tags` lets F-Droid discover future version tags.
+- From 1.12.0, the build uses `gradleprops: naslink.enableAbiSplits=true` to match the GitHub release configuration, with `output: build/outputs/apk/release/app-universal-release-unsigned.apk` to select the universal APK. Disabling splits changes the generated optimization profiles and prevents signature verification against the upstream APK.
+
+For a local reproducibility check, use a normal Git checkout of the release tag. Android's build tool does not recognize the managed worktree's Git metadata, which changes `META-INF/version-control-info.textproto`. Run `./gradlew clean assembleRelease -Pnaslink.enableAbiSplits=true` and compare the universal unsigned APK with the published universal APK using F-Droid's signature-copy verification.
+
+After a new GitHub release commit is final, update the F-Droid build block to the release commit hash and matching version if the F-Droid metadata is maintained in this repository.

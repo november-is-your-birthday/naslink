@@ -1,0 +1,70 @@
+package com.naslink.data.model
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class FileItemTest {
+
+    @Test
+    fun apkFilesUseAndroidPackageMimeType() {
+        val file = FileItem(
+            name = "installer.apk",
+            path = "/storage/emulated/0/Download/installer.apk",
+            isDirectory = false,
+        )
+
+        assertEquals("application/vnd.android.package-archive", file.mimeType)
+        assertTrue(file.isApk)
+    }
+
+    @Test
+    fun imageThumbnailEligibilityIsLocalOnly() {
+        val localImage = FileItem(
+            name = "photo.jpg",
+            path = "/storage/emulated/0/Pictures/photo.jpg",
+            isDirectory = false,
+            source = FileSource.LOCAL,
+        )
+        val remoteImage = localImage.copy(source = FileSource.WEBDAV)
+        val localFolder = localImage.copy(name = "Pictures", isDirectory = true)
+
+        assertTrue(localImage.usesLocalImageThumbnail)
+        assertFalse(remoteImage.usesLocalImageThumbnail)
+        assertFalse(localFolder.usesLocalImageThumbnail)
+    }
+
+    @Test
+    fun pdfDetectionIsCaseInsensitiveAndExcludesDirectories() {
+        val pdf = FileItem(
+            name = "Report.PDF",
+            path = "/storage/emulated/0/Documents/Report.PDF",
+            isDirectory = false,
+        )
+
+        assertTrue(pdf.isPdf)
+        assertFalse(pdf.copy(name = "PDF files", isDirectory = true).isPdf)
+        assertFalse(pdf.copy(name = "Report.pdf.txt").isPdf)
+    }
+
+    @Test
+    fun officePreviewEligibilityExcludesLegacyFormatsAndDirectories() {
+        val document = FileItem(name = "report.DOCX", path = "/payload", isDirectory = false)
+        assertTrue(document.isOfficeDocument)
+        assertTrue(document.copy(name = "slides.pptx").isOfficeDocument)
+        assertTrue(document.copy(name = "sheet.xlsx").isOfficeDocument)
+        assertFalse(document.copy(name = "report.doc").isOfficeDocument)
+        assertFalse(document.copy(name = "data.zip").isOfficeDocument)
+        assertFalse(document.copy(isDirectory = true).isOfficeDocument)
+    }
+
+    @Test
+    fun compressedTarAliasesAreRecognizedAsArchives() {
+        val tgz = FileItem(name = "backup.tgz", path = "/backup.tgz", isDirectory = false)
+        val tbz2 = FileItem(name = "backup.tbz2", path = "/backup.tbz2", isDirectory = false)
+
+        assertTrue(tgz.isArchive)
+        assertTrue(tbz2.isArchive)
+    }
+}

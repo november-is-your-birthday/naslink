@@ -1,0 +1,354 @@
+package com.naslink.ui.components
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Android
+import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.VideoFile
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.naslink.app.ThumbnailLoadingGate
+import com.naslink.playback.RemoteImagePublisher
+import com.naslink.data.model.FileItem
+import com.naslink.data.model.FileSource
+import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+internal const val PDF_THUMBNAIL_TEST_TAG = "pdf-thumbnail"
+internal const val APK_THUMBNAIL_TEST_TAG = "apk-thumbnail"
+internal const val VIDEO_THUMBNAIL_TEST_TAG = "video-thumbnail"
+internal const val OFFICE_THUMBNAIL_TEST_TAG = "office-thumbnail"
+internal const val FILE_ICON_TEST_TAG = "file-icon"
+internal const val REMOTE_IMAGE_THUMBNAIL_TEST_TAG = "remote-image-thumbnail"
+
+@Composable
+fun FileThumbnailOrIcon(
+    file: FileItem,
+    iconSize: Dp,
+    modifier: Modifier = Modifier,
+    /**
+     * Supplies remote images. Null in screens with no remote session, where SMB files then
+     * fall back to the type icon exactly as before.
+     */
+    remoteImages: RemoteImagePublisher? = null,
+) {
+    val icon = fileIcon(file)
+    // Parked while a full-screen viewer or player owns the screen, and while the grid is
+    // still flinging: a remote preview is a real file read over the same SMB session the
+    // viewer is waiting on, and a fling composes far more cells than it ever shows.
+    val thumbnailsEnabled by ThumbnailLoadingGate.enabled.collectAsState()
+    if (MediaThumbnailLoader.supports(file)) {
+        val context = LocalContext.current
+        val sizePixels = with(LocalDensity.current) { iconSize.roundToPx().coerceAtLeast(1) }
+        var thumbnail by remember(file, sizePixels) { mutableStateOf<android.graphics.Bitmap?>(null) }
+        LaunchedEffect(file, sizePixels) {
+            thumbnail = MediaThumbnailLoader.load(
+                context = context,
+                file = file,
+                maxWidth = sizePixels,
+                maxHeight = sizePixels,
+            ).getOrNull()
+        }
+        Surface(
+            modifier = modifier.size(iconSize),
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            thumbnail?.let { bitmap ->
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = if (file.isVideo) ContentScale.Crop else ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().testTag(
+                        if (file.isVideo) VIDEO_THUMBNAIL_TEST_TAG else OFFICE_THUMBNAIL_TEST_TAG,
+                    ),
+                )
+            } ?: Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize().padding(4.dp).testTag(FILE_ICON_TEST_TAG),
+                tint = fileIconTint(file),
+            )
+        }
+        return
+    }
+
+    if (file.isPdf && (file.source == FileSource.LOCAL || file.source == FileSource.SAF)) {
+        val context = LocalContext.current
+        val sizePixels = with(LocalDensity.current) { iconSize.roundToPx().coerceAtLeast(1) }
+        val thumbnail by produceState<android.graphics.Bitmap?>(
+            initialValue = null,
+            file.source,
+            file.path,
+            file.lastModified,
+            sizePixels,
+        ) {
+            value = PdfThumbnailLoader.load(
+                context = context,
+                file = file,
+                maxWidth = sizePixels,
+                maxHeight = sizePixels,
+            ).getOrNull()
+        }
+        Surface(
+            modifier = modifier.size(iconSize),
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            if (thumbnail != null) {
+                Image(
+                    bitmap = checkNotNull(thumbnail).asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag(PDF_THUMBNAIL_TEST_TAG),
+                )
+            } else {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(4.dp)
+                        .testTag(FILE_ICON_TEST_TAG),
+                    tint = fileIconTint(file),
+                )
+            }
+        }
+        return
+    }
+
+    if (file.isApk && file.source == FileSource.LOCAL) {
+        val context = LocalContext.current
+        val sizePixels = with(LocalDensity.current) { iconSize.roundToPx().coerceAtLeast(1) }
+        val thumbnail by produceState<android.graphics.Bitmap?>(
+            initialValue = null,
+            file.source,
+            file.path,
+            file.size,
+            file.lastModified,
+            sizePixels,
+        ) {
+            value = withContext(Dispatchers.IO) {
+                ApkThumbnailLoader.load(
+                    context = context,
+                    file = file,
+                    maxWidth = sizePixels,
+                    maxHeight = sizePixels,
+                ).getOrNull()
+            }
+        }
+        Surface(
+            modifier = modifier.size(iconSize),
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            if (thumbnail != null) {
+                Image(
+                    bitmap = checkNotNull(thumbnail).asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag(APK_THUMBNAIL_TEST_TAG),
+                )
+            } else {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(4.dp)
+                        .testTag(FILE_ICON_TEST_TAG),
+                    tint = fileIconTint(file),
+                )
+            }
+        }
+        return
+    }
+
+    // Remote videos get a frame preview through the same loopback publisher as remote
+    // images: MediaMetadataRetriever range-reads just the bytes one frame needs, so a
+    // grid of clips costs kilobytes each instead of full downloads. Unreadable formats
+    // fall back to the video icon exactly like every other loader here.
+    if (file.isVideo && remoteImages != null && file.source == FileSource.SMB && thumbnailsEnabled) {
+        val context = LocalContext.current
+        val published = remember(file, remoteImages) { remoteImages.publishVideo(file) }
+        if (published != null) {
+            val sizePixels = with(LocalDensity.current) { iconSize.roundToPx().coerceAtLeast(1) }
+            val thumbnail by produceState<android.graphics.Bitmap?>(
+                initialValue = null,
+                published.url,
+                file.size,
+                file.lastModified,
+                sizePixels,
+            ) {
+                value = RemoteVideoThumbnailLoader.load(
+                    context = context,
+                    url = published.url,
+                    // Connection-scoped file identity, matching the key the image
+                    // previews use: path+size+mtime alone could collide across two
+                    // servers that export the same paths.
+                    version = remoteImages.cacheKey(file),
+                    maxWidth = sizePixels,
+                    maxHeight = sizePixels,
+                )
+            }
+            Surface(
+                modifier = modifier.size(iconSize),
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surfaceVariant,
+            ) {
+                if (thumbnail != null) {
+                    Image(
+                        bitmap = checkNotNull(thumbnail).asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize().testTag(VIDEO_THUMBNAIL_TEST_TAG),
+                    )
+                } else {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize().padding(4.dp).testTag(FILE_ICON_TEST_TAG),
+                        tint = fileIconTint(file),
+                    )
+                }
+            }
+            return
+        }
+    }
+
+    // Remote photos are read as bytes and cached as *generated previews*, never as the
+    // original file. Coil used to fetch the whole photo and park it in its disk cache to
+    // decode a 300 px cell, so one folder of a few hundred pictures cost hundreds of
+    // megabytes for previews the user never opened at full size.
+    if (remoteImages != null && RemoteImagePublisher.supports(file)) {
+        val sizePixels = with(LocalDensity.current) { iconSize.roundToPx().coerceAtLeast(1) }
+        // Stable per-file identity (connection + path + size + mtime), so a preview
+        // survives a new random loopback token and an overwritten file is re-read.
+        val identity = remember(file, remoteImages) { remoteImages.cacheKey(file) }
+        var thumbnail by remember(identity, sizePixels) {
+            mutableStateOf(RemoteImageThumbnailLoader.cachedPreview(identity))
+        }
+        LaunchedEffect(identity, sizePixels, thumbnailsEnabled) {
+            if (!thumbnailsEnabled) return@LaunchedEffect
+            thumbnail = RemoteImageThumbnailLoader.load(
+                connection = remoteImages.connection,
+                file = file,
+                identity = identity,
+                targetPx = sizePixels,
+            )
+        }
+        Surface(
+            modifier = modifier.size(iconSize),
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            val bitmap = thumbnail
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize().testTag(REMOTE_IMAGE_THUMBNAIL_TEST_TAG),
+                )
+            } else {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize().padding(4.dp).testTag(FILE_ICON_TEST_TAG),
+                    tint = fileIconTint(file),
+                )
+            }
+        }
+        return
+    }
+
+    if (file.usesLocalImageThumbnail) {
+        val fallbackPainter = rememberVectorPainter(icon)
+        Surface(
+            modifier = modifier.size(iconSize),
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            AsyncImage(
+                model = ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
+                    .data(File(file.path))
+                    .memoryCacheKey(fileThumbnailCacheKey(file))
+                    .crossfade(true)
+                    .build(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                placeholder = fallbackPainter,
+                error = fallbackPainter,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        return
+    }
+
+    Icon(
+        imageVector = icon,
+        contentDescription = null,
+        modifier = modifier
+            .size(iconSize)
+            .testTag(FILE_ICON_TEST_TAG),
+        tint = fileIconTint(file),
+    )
+}
+
+@Composable
+private fun fileIconTint(file: FileItem) = when {
+    file.isDirectory -> MaterialTheme.colorScheme.primary
+    file.isImage -> MaterialTheme.colorScheme.tertiary
+    file.isVideo -> MaterialTheme.colorScheme.error
+    file.isAudio -> MaterialTheme.colorScheme.secondary
+    file.isApk -> MaterialTheme.colorScheme.tertiary
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+private fun fileIcon(file: FileItem): ImageVector = when {
+    file.isDirectory -> Icons.Filled.Folder
+    file.isImage -> Icons.Filled.Image
+    file.isVideo -> Icons.Filled.VideoFile
+    file.isAudio -> Icons.Filled.AudioFile
+    file.isText -> Icons.Filled.Description
+    file.isArchive -> Icons.Filled.Archive
+    file.isApk -> Icons.Filled.Android
+    else -> Icons.AutoMirrored.Filled.InsertDriveFile
+}
+
+internal fun fileThumbnailCacheKey(file: FileItem): String =
+    "${file.path}|${file.size}|${file.lastModified.time}"

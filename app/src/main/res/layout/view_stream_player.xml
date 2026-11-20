@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    TextureView rather than the default SurfaceView: pinch-to-zoom transforms the picture
+    with a Compose graphics layer, and a SurfaceView is composited in its own layer that
+    ignores those transforms on most devices.
+
+    The controller stays off — the player draws its own Compose controls, which can show
+    gestures (long-press speed, drag-to-seek) that the stock controller has no concept of.
+-->
+<androidx.media3.ui.PlayerView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/stream_player_view"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    app:resize_mode="fit"
+    app:shutter_background_color="@android:color/black"
+    app:show_buffering="never"
+    app:surface_type="texture_view"
+    app:use_controller="false" />

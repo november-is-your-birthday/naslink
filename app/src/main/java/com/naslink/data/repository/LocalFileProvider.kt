@@ -1,0 +1,188 @@
+package com.naslink.data.repository
+
+import com.naslink.data.model.FileItem
+import com.naslink.data.model.FileSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.Date
+
+class LocalFileProvider : FileProvider {
+    override fun isSameStorage(other: FileProvider): Boolean = other is LocalFileProvider
+    override fun isSamePath(path: String, other: FileProvider, otherPath: String): Boolean =
+        if (other is RootFileProvider) other.isSamePath(otherPath, path)
+        else super.isSamePath(path, other, otherPath)
+    override suspend fun isDescendantPath(ancestor: String, other: FileProvider, path: String): Boolean =
+        if (other is RootFileProvider) other.isDescendantPath(ancestor, path)
+        else super.isDescendantPath(ancestor, other, path)
+    override fun isSamePath(first: String, second: String): Boolean = File(first).canonicalFile == File(second).canonicalFile
+
+
+    override suspend fun listFiles(path: String): Result<List<FileItem>> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val dir = File(path)
+                if (!dir.exists()) throw IllegalArgumentException("Path does not exist: $path")
+                if (!dir.isDirectory) throw IllegalArgumentException("Not a directory: $path")
+                dir.listFiles()?.map { it.toFileItem() } ?: emptyList()
+            }
+        }
+
+    override suspend fun createDirectory(path: String, name: String): Result<FileItem> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val dir = File(path, name)
+                if (!dir.mkdirs()) throw IllegalStateException("Failed to create directory: ${dir.absolutePath}")
+                dir.toFileItem()
+            }
+        }
+
+    override suspend fun createFile(path: String, name: String): Result<FileItem> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val file = File(path, name)
+                if (!file.createNewFile()) throw IllegalStateException("Failed to create file: ${file.absolutePath}")
+                file.toFileItem()
+            }
+        }
+
+    override suspend fun delete(path: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val file = File(path)
+                if (file.isDirectory) {
+                    if (!file.deleteRecursively()) throw IllegalStateException("Failed to delete: $path")
+                } else {
+                    if (!file.delete()) throw IllegalStateException("Failed to delete: $path")
+                }
+            }
+        }
+
+    override suspend fun rename(oldPath: String, newName: String): Result<FileItem> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val oldFile = File(oldPath)
+                val newFile = File(oldFile.parent, newName)
+                requireSource(oldFile)
+                if (newFile.exists()) throw IllegalStateException("$newName already exists in this folder")
+                if (!oldFile.renameTo(newFile)) throw IllegalStateException("Failed to rename")
+                newFile.toFileItem()
+            }
+        }
+
+    override suspend fun copy(sourcePath: String, destPath: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val source = File(sourcePath)
+                val target = requireSafeTarget(source, File(destPath))
+                copyToNewTarget(source, target)
+            }
+        }
+
+    override suspend fun move(sourcePath: String, destPath: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val source = File(sourcePath)
+                val target = requireSafeTarget(source, File(destPath))
+                TransferCancellation.check()
+                if (source.renameTo(target)) return@runCatching
+
+                copyToNewTarget(source, target)
+                TransferCancellation.check()
+                val deleted = if (source.isDirectory) source.deleteRecursively() else source.delete()
+                if (!deleted) {
+                    throw IOException(
+                        "Copied ${source.name}, but could not remove the original. Both copies were kept.",
+                    )
+                }
+            }
+        }
+
+    override suspend fun getInputStream(path: String): Result<InputStream> =
+        withContext(Dispatchers.IO) {
+            runCatching { FileInputStream(File(path)) }
+        }
+
+    override suspend fun getOutputStream(path: String): Result<OutputStream> =
+        withContext(Dispatchers.IO) {
+            runCatching { FileOutputStream(File(path)) }
+        }
+
+    override suspend fun exists(path: String): Boolean =
+        withContext(Dispatchers.IO) { File(path).exists() }
+
+    override suspend fun getFileInfo(path: String): Result<FileItem> =
+        withContext(Dispatchers.IO) {
+            runCatching { File(path).toFileItem() }
+        }
+
+    override fun getParentPath(path: String): String? = File(path).parent
+
+    private fun requireSafeTarget(source: File, destinationDirectory: File): File {
+        requireSource(source)
+        if (!destinationDirectory.exists()) {
+            throw IllegalArgumentException("Destination does not exist: ${destinationDirectory.path}")
+        }
+        if (!destinationDirectory.isDirectory) {
+            throw IllegalArgumentException("Destination is not a folder: ${destinationDirectory.path}")
+        }
+
+        val target = File(destinationDirectory, source.name)
+        if (target.exists()) {
+            throw IllegalStateException("${source.name} already exists in this folder")
+        }
+        if (source.isDirectory && target.canonicalFile.toPath().startsWith(source.canonicalFile.toPath())) {
+            throw IllegalArgumentException("A folder cannot be copied or moved into itself")
+        }
+        return target
+    }
+
+    private fun requireSource(source: File) {
+        if (!source.exists()) throw IllegalArgumentException("Source does not exist: ${source.path}")
+    }
+
+    private fun copyToNewTarget(source: File, target: File) {
+        TransferCancellation.check()
+        var created = false
+        try {
+            if (source.isDirectory) {
+                if (!target.mkdir()) throw IOException("Could not create ${target.name}")
+                created = true
+                val children = source.listFiles() ?: throw IOException("Could not list ${source.name}")
+                children.forEach { child -> copyToNewTarget(child, File(target, child.name)) }
+            } else {
+                java.nio.file.Files.newOutputStream(target.toPath(), java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE).use { output ->
+                    created = true
+                    source.inputStream().use { input ->
+                        StreamTransfer.copy(input, output, source.path, source.length())
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            if (created && target.exists()) target.deleteRecursively()
+            throw error
+        }
+    }
+
+    private fun File.toFileItem(): FileItem = FileItem(
+        name = name,
+        path = absolutePath,
+        isDirectory = isDirectory,
+        size = if (isDirectory) 0 else length(),
+        lastModified = Date(lastModified()),
+        isHidden = isHidden,
+        permissions = buildPermissionString(),
+        source = FileSource.LOCAL,
+    )
+
+    private fun File.buildPermissionString(): String = buildString {
+        append(if (canRead()) "r" else "-")
+        append(if (canWrite()) "w" else "-")
+        append(if (canExecute()) "x" else "-")
+    }
+}

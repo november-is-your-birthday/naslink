@@ -1,0 +1,821 @@
+package com.naslink.ui.screens
+
+import android.content.Intent
+import android.net.Uri
+import android.text.format.Formatter
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Android
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SdStorage
+import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.compose.ui.res.booleanResource
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import com.naslink.R
+import com.naslink.ui.components.TranslationNotice
+import com.naslink.ui.components.ThumbnailCaches
+import com.naslink.ui.components.rememberTranslationLinkOpener
+import com.naslink.data.index.StorageCategory
+import com.naslink.data.model.Bookmark
+import com.naslink.data.model.FileItem
+import com.naslink.data.model.FileSource
+import com.naslink.data.model.HomeSection
+import com.naslink.data.model.RemoteConnection
+import com.naslink.util.FileUtils
+import com.naslink.util.StorageInfo
+import com.naslink.util.StorageVolumeInfo
+import com.naslink.viewmodel.BrowserSession
+import com.naslink.viewmodel.FileBrowserViewModel
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@Composable
+fun HomeScreen(
+    viewModel: FileBrowserViewModel,
+    onNavigateToBrowser: (String) -> Unit,
+    onNavigateToSession: (String, String) -> Unit,
+    onNavigateToConnections: () -> Unit,
+    onNavigateToTrash: () -> Unit,
+    onNavigateToSettings: () -> Unit,
+    onOpenSafTree: (Uri) -> Unit,
+    hasAllFilesAccess: Boolean,
+    onRequestAllFilesAccess: () -> Unit,
+    onNavigateToCategory: (StorageCategory) -> Unit = {},
+    onOpenConnection: (RemoteConnection) -> Unit = {},
+) {
+    val bookmarks by viewModel.bookmarks.collectAsState()
+    val dismissedTranslationNotices by viewModel.dismissedTranslationNotices.collectAsState()
+    val translationUrl = stringResource(R.string.translation_crowdin_url)
+    val isProvisionalTranslation = booleanResource(R.bool.translation_provisional)
+    val openTranslationLink = rememberTranslationLinkOpener()
+    var bookmarkToRemove by remember { mutableStateOf<Bookmark?>(null) }
+    val removeBookmarkLabel = stringResource(R.string.action_remove_bookmark)
+    val sessions by viewModel.sessions.collectAsState()
+    val activeSession by viewModel.activeSession.collectAsState()
+    val homeLayout by viewModel.homeLayout.collectAsState()
+    val connections by viewModel.connections.collectAsState()
+    // Pinned connections live outside the section list on purpose: "always on the home
+    // screen" must survive the user reordering or hiding the remote-connections section.
+    val pinnedConnections = connections.filter { it.isFavorite }
+    val context = LocalContext.current
+    val safTreeLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
+        onOpenSafTree(uri)
+    }
+    val storageVolumes = remember(context, hasAllFilesAccess) {
+        if (hasAllFilesAccess) FileUtils.getStorageVolumes(context) else emptyList()
+    }
+    val storageInfoByPath = remember(storageVolumes) {
+        storageVolumes.mapNotNull { volume ->
+            volume.path?.takeIf { volume.isAvailable }?.let { path -> path to FileUtils.getStorageInfo(path) }
+        }.toMap()
+    }
+    val directories = remember { FileUtils.getCommonDirectories() }
+    val visibleSessions = sessions.filter { hasAllFilesAccess || it.source != FileSource.LOCAL }
+    val localBookmarks = bookmarks.filter { it.source == FileSource.LOCAL }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.app_name)) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                ),
+                actions = {
+                    IconButton(onClick = onNavigateToSettings) {
+                        Icon(Icons.Filled.Settings, stringResource(R.string.content_desc_settings))
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                Spacer(modifier = Modifier.height(4.dp))
+            }
+            if (isProvisionalTranslation && dismissedTranslationNotices?.contains(translationUrl) == false) {
+                item(key = "translation-notice") {
+                    TranslationNotice(
+                        onImprove = {
+                            openTranslationLink()
+                            viewModel.dismissTranslationNotice(translationUrl)
+                        },
+                        onDismiss = { viewModel.dismissTranslationNotice(translationUrl) },
+                    )
+                }
+            }
+            item(key = "quick-actions") {
+                HomeQuickActions(viewModel)
+            }
+            if (pinnedConnections.isNotEmpty()) {
+                item(key = "pinned-connections-header") {
+                    Row(
+                        modifier = Modifier.padding(top = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            stringResource(R.string.home_pinned_connections),
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            stringResource(R.string.home_pinned_hint),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        )
+                    }
+                }
+                items(pinnedConnections, key = { "pinned:${it.id}" }) { connection ->
+                    PinnedConnectionCard(
+                        connection = connection,
+                        onClick = { onOpenConnection(connection) },
+                        onUnpin = { viewModel.setConnectionPinned(connection, false) },
+                    )
+                }
+            }
+            homeLayout?.visibleSections?.forEach { section ->
+                when (section) {
+                    HomeSection.STORAGE -> {
+                        if (hasAllFilesAccess) {
+                            item(key = "storage-header") {
+                                Text(
+                                    stringResource(R.string.home_storage_section),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            items(
+                                items = storageVolumes,
+                                key = { "storage:${it.description}:${it.path}:${it.isPrimary}" },
+                            ) { volume ->
+                                StorageVolumeCard(
+                                    volume = volume,
+                                    storageInfo = volume.path?.let(storageInfoByPath::get),
+                                    onClick = { volume.path?.let(onNavigateToBrowser) },
+                                )
+                            }
+                        } else {
+                            item(key = "limited-storage") {
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable(onClick = onRequestAllFilesAccess),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    ),
+                                ) {
+                                    Column(modifier = Modifier.padding(16.dp)) {
+                                        Text(
+                                            stringResource(R.string.home_limited_storage_title),
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        )
+                                        Text(
+                                            stringResource(R.string.home_limited_storage_message),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        item(key = "document-tree") {
+                            SafAccessCard(onClick = { safTreeLauncher.launch(null) })
+                        }
+
+                        if (hasAllFilesAccess) {
+                            item(key = "trash") {
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable(onClick = onNavigateToTrash),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    ),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(16.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.DeleteOutline,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(28.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Column {
+                                            Text(stringResource(R.string.home_trash), style = MaterialTheme.typography.titleMedium)
+                                            Text(
+                                                stringResource(R.string.home_trash_description),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HomeSection.ACTIVE_SESSIONS -> {
+                        if (visibleSessions.isNotEmpty()) {
+                            item(key = "active-sessions-header") {
+                                Text(
+                                    stringResource(R.string.home_active_sessions_title),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                            }
+                            items(visibleSessions, key = { "session:${it.id}" }) { session ->
+                                ActiveSessionRow(
+                                    session = session,
+                                    isActive = session.id == activeSession?.id,
+                                    onClick = { onNavigateToSession(session.id, session.currentPath) },
+                                )
+                            }
+                        }
+                    }
+
+                    HomeSection.QUICK_ACCESS -> {
+                        item(key = "quick-access-header") {
+                            Text(
+                                stringResource(R.string.home_quick_access_title),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                        item(key = "quick-access-cards") {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                StorageCategory.entries.chunked(3).forEach { row ->
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        row.forEach { category ->
+                                            QuickAccessCard(
+                                                icon = when (category) {
+                                                    StorageCategory.APPS -> Icons.Filled.Android
+                                                    StorageCategory.VIDEOS -> Icons.Filled.VideoLibrary
+                                                    StorageCategory.AUDIO -> Icons.Filled.MusicNote
+                                                    StorageCategory.IMAGES -> Icons.Filled.Image
+                                                    StorageCategory.DOCUMENTS -> Icons.AutoMirrored.Filled.InsertDriveFile
+                                                },
+                                                label = stringResource(category.filter.labelRes),
+                                                modifier = Modifier.weight(1f),
+                                                onClick = { onNavigateToCategory(category) },
+                                            )
+                                        }
+                                        repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HomeSection.REMOTE_CONNECTIONS -> {
+                        item(key = "remote-connections") {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onNavigateToConnections() },
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                ),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(16.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Cloud,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(28.dp),
+                                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text(
+                                            stringResource(R.string.home_remote_connections_title),
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        )
+                                        Text(
+                                            stringResource(R.string.home_remote_protocols),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HomeSection.BOOKMARKS -> {
+                        if (hasAllFilesAccess && localBookmarks.isNotEmpty()) {
+                            item(key = "bookmarks-header") {
+                                Text(
+                                    stringResource(R.string.home_bookmarks_title),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                            }
+                            items(localBookmarks, key = { "bookmark:${it.id}" }) { bookmark ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("home-bookmark:${bookmark.id}")
+                                        .combinedClickable(
+                                            onClick = { onNavigateToBrowser(bookmark.path) },
+                                            onLongClickLabel = removeBookmarkLabel,
+                                            onLongClick = { bookmarkToRemove = bookmark },
+                                        )
+                                        .padding(vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Bookmark,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text(bookmark.name, style = MaterialTheme.typography.bodyLarge)
+                                        Text(
+                                            bookmark.path,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HomeSection.FOLDERS -> {
+                        if (hasAllFilesAccess) {
+                            item(key = "folders-header") {
+                                Text(
+                                    stringResource(R.string.home_folders_title),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                )
+                            }
+                            items(directories, key = { "folder:${it.path}" }) { dir ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onNavigateToBrowser(dir.path) }
+                                        .padding(vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        if (dir.isPrimary) Icons.Filled.PhoneAndroid else Icons.Filled.Folder,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(24.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(16.dp))
+                                    Text(stringResource(dir.labelRes), style = MaterialTheme.typography.bodyLarge)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item { Spacer(modifier = Modifier.height(16.dp)) }
+        }
+    }
+    bookmarkToRemove?.let { bookmark ->
+        AlertDialog(
+            onDismissRequest = { bookmarkToRemove = null },
+            title = { Text(removeBookmarkLabel) },
+            text = { Text(bookmark.name) },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.removeBookmark(bookmark.path, bookmark.source)
+                    bookmarkToRemove = null
+                }) { Text(removeBookmarkLabel) }
+            },
+            dismissButton = {
+                TextButton(onClick = { bookmarkToRemove = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SafAccessCard(
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Filled.FolderOpen,
+                contentDescription = null,
+                modifier = Modifier.size(28.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+                Text(
+                    stringResource(R.string.home_document_tree),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    stringResource(R.string.home_storage_access_framework),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun StorageVolumeCard(
+    volume: StorageVolumeInfo,
+    storageInfo: StorageInfo?,
+    onClick: () -> Unit,
+) {
+    val statusLabel = volume.statusLabelRes?.let { stringResource(it) }
+    val isInternal = volume.isPrimary
+    val availableLabel = stringResource(R.string.home_storage_available)
+    val storageUsage = if (storageInfo != null) {
+        stringResource(
+            R.string.home_storage_usage,
+            FileItem.formatFileSize(storageInfo.used),
+            FileItem.formatFileSize(storageInfo.total),
+        )
+    } else {
+        null
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("storage-volume:${volume.description}")
+            .semantics { stateDescription = statusLabel ?: availableLabel }
+            .clickable(enabled = volume.isAvailable, onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isInternal)
+                MaterialTheme.colorScheme.primaryContainer
+            else MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    if (isInternal) Icons.Filled.PhoneAndroid else Icons.Filled.SdStorage,
+                    contentDescription = null,
+                    modifier = Modifier.size(32.dp),
+                    tint = if (isInternal)
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        volume.description,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = if (isInternal)
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        else MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        statusLabel ?: storageUsage ?: volume.path.orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isInternal)
+                            MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            if (storageInfo != null && statusLabel == null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { storageInfo.usedPercentage },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * A connection the user pinned to the home screen: one tap connects and opens it.
+ *
+ * The card carries the protocol and address rather than a bare name, because several
+ * connections often share a friendly name ("家里 NAS" at two addresses is a real setup).
+ */
+@Composable
+private fun PinnedConnectionCard(
+    connection: RemoteConnection,
+    onClick: () -> Unit,
+    onUnpin: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("home-pinned-connection:${connection.id}")
+            .clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = protocolIcon(connection.protocol),
+                contentDescription = null,
+                modifier = Modifier.size(28.dp),
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    connection.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    stringResource(
+                        R.string.connection_summary,
+                        stringResource(connection.protocol.displayNameRes),
+                        connection.host,
+                        connection.port,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onUnpin) {
+                Icon(
+                    Icons.Filled.PushPin,
+                    stringResource(R.string.connection_unpin_from_home),
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveSessionRow(
+    session: BrowserSession,
+    isActive: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                if (session.source == FileSource.LOCAL || session.source == FileSource.SAF || session.source == FileSource.ROOT) {
+                    Icons.Filled.Folder
+                } else {
+                    Icons.Filled.Cloud
+                },
+                contentDescription = null,
+                tint = if (isActive) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(28.dp),
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    session.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    session.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (isActive) {
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    stringResource(R.string.home_session_active),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickAccessCard(
+    icon: ImageVector,
+    label: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = modifier.clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .padding(12.dp)
+                .fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Icon(
+                icon,
+                contentDescription = label,
+                modifier = Modifier.size(28.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
+ * Home quick actions: one-tap maintenance jobs that would otherwise hide in Settings.
+ * The image-cache entry shows the current footprint and clears Coil's memory + disk
+ * caches in place, so a NAS session can reclaim space without leaving the home screen.
+ */
+@Composable
+private fun HomeQuickActions(viewModel: FileBrowserViewModel) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val cacheGeneration by viewModel.imageCacheGeneration.collectAsState()
+    var cacheBytes by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(cacheGeneration) {
+        cacheBytes = withContext(Dispatchers.IO) {
+            ThumbnailCaches.sizeBytes()
+        }
+    }
+    Column {
+        Text(
+            stringResource(R.string.home_quick_actions),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        scope.launch {
+                            viewModel.clearImageCache()
+                            Toast.makeText(
+                                context,
+                                R.string.settings_image_cache_cleared,
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                    .padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.CleaningServices,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        stringResource(R.string.settings_clear_image_cache),
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    cacheBytes?.let { bytes ->
+                        Text(
+                            stringResource(
+                                R.string.settings_image_cache_size,
+                                Formatter.formatFileSize(context, bytes),
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

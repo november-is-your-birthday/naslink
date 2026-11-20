@@ -1,0 +1,256 @@
+package com.naslink.data.local
+
+import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.MutablePreferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import com.naslink.data.model.SortBy
+import com.naslink.data.duplicates.DuplicateScanner
+import com.naslink.data.model.SortOrder
+import com.naslink.data.model.HomeLayout
+import com.naslink.data.model.HomeSection
+import com.naslink.data.model.SessionAutoCloseTimeout
+import com.naslink.data.model.SearchBarMode
+import com.naslink.data.model.ViewMode
+import com.naslink.ui.theme.AppTheme
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+
+private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+
+class PreferencesManager(private val context: Context) {
+
+    private object Keys {
+        val SEARCH_BAR_MODE = stringPreferencesKey("search_bar_mode")
+        val GRID_COLUMNS = intPreferencesKey("grid_columns")
+        val THEME = stringPreferencesKey("theme")
+        val SHOW_HIDDEN = booleanPreferencesKey("show_hidden")
+        val USE_TRASH = booleanPreferencesKey("use_trash")
+        val CONFIRM_REMOTE_DOWNLOADS = booleanPreferencesKey("confirm_remote_downloads")
+        val DUPLICATE_EXCLUSION_KEYWORDS = stringSetPreferencesKey("duplicate_exclusion_keywords")
+        val LIMITED_ACCESS_ACCEPTED = booleanPreferencesKey("limited_access_accepted")
+        val DISMISSED_TRANSLATION_NOTICES = stringSetPreferencesKey("dismissed_translation_notices")
+        val SORT_BY = stringPreferencesKey("sort_by")
+        val SORT_ORDER = stringPreferencesKey("sort_order")
+        val VIEW_MODE = stringPreferencesKey("view_mode")
+        val DEFAULT_PATH = stringPreferencesKey("default_path")
+        val AUTO_CLOSE_SESSIONS = booleanPreferencesKey("auto_close_sessions")
+        val SESSION_AUTO_CLOSE_TIMEOUT = stringPreferencesKey("session_auto_close_timeout")
+        val HOME_SECTION_ORDER = stringPreferencesKey("home_section_order")
+        val HOME_HIDDEN_SECTIONS = stringPreferencesKey("home_hidden_sections")
+        val CUSTOM_PRIMARY = longPreferencesKey("custom_primary")
+        val CUSTOM_BACKGROUND = longPreferencesKey("custom_background")
+        val CUSTOM_SURFACE = longPreferencesKey("custom_surface")
+        val PLAYBACK_SPEED = floatPreferencesKey("playback_speed")
+    }
+
+    val theme: Flow<AppTheme> = context.dataStore.data.map { prefs ->
+        AppTheme.fromName(prefs[Keys.THEME] ?: AppTheme.SYSTEM.name)
+    }
+
+    val showHidden: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.SHOW_HIDDEN] ?: false
+    }
+
+    val useTrash: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.USE_TRASH] ?: true
+    }
+
+    val confirmRemoteDownloads: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.CONFIRM_REMOTE_DOWNLOADS] ?: true
+    }
+
+    suspend fun setConfirmRemoteDownloads(confirm: Boolean) {
+        context.dataStore.edit { it[Keys.CONFIRM_REMOTE_DOWNLOADS] = confirm }
+    }
+
+    /** Last speed chosen in the stream player; 1f until the user changes it. */
+    val playbackSpeed: Flow<Float> = context.dataStore.data.map { prefs ->
+        prefs[Keys.PLAYBACK_SPEED] ?: 1f
+    }
+
+    suspend fun setPlaybackSpeed(speed: Float) {
+        context.dataStore.edit { it[Keys.PLAYBACK_SPEED] = speed }
+    }
+
+    val duplicateExclusionKeywords: Flow<Set<String>> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DUPLICATE_EXCLUSION_KEYWORDS] ?: DuplicateScanner.DEFAULT_EXCLUDED_DIRECTORY_KEYWORDS
+    }
+
+    suspend fun setDuplicateExclusionKeywords(keywords: Set<String>) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DUPLICATE_EXCLUSION_KEYWORDS] = keywords.map(String::trim).filter(String::isNotEmpty).toSet()
+        }
+    }
+
+    /** Read after already-queued edits, including a save accepted by a previous screen. */
+    suspend fun readDuplicateExclusionKeywords(): Set<String> {
+        val snapshot = context.dataStore.updateData { it }
+        return snapshot[Keys.DUPLICATE_EXCLUSION_KEYWORDS] ?: DuplicateScanner.DEFAULT_EXCLUDED_DIRECTORY_KEYWORDS
+    }
+
+    val limitedAccessAccepted: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.LIMITED_ACCESS_ACCEPTED] ?: false
+    }
+
+    val dismissedTranslationNotices: Flow<Set<String>> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DISMISSED_TRANSLATION_NOTICES] ?: emptySet()
+    }
+
+    suspend fun dismissTranslationNotice(languageUrl: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DISMISSED_TRANSLATION_NOTICES] =
+                (prefs[Keys.DISMISSED_TRANSLATION_NOTICES] ?: emptySet()) + languageUrl
+        }
+    }
+
+    val sortBy: Flow<SortBy> = context.dataStore.data.map { prefs ->
+        try { SortBy.valueOf(prefs[Keys.SORT_BY] ?: SortBy.NAME.name) }
+        catch (_: Exception) { SortBy.NAME }
+    }
+
+    val sortOrder: Flow<SortOrder> = context.dataStore.data.map { prefs ->
+        try { SortOrder.valueOf(prefs[Keys.SORT_ORDER] ?: SortOrder.ASCENDING.name) }
+        catch (_: Exception) { SortOrder.ASCENDING }
+    }
+
+    val viewMode: Flow<ViewMode> = context.dataStore.data.map { prefs ->
+        try { ViewMode.valueOf(prefs[Keys.VIEW_MODE] ?: ViewMode.LIST.name) }
+        catch (_: Exception) { ViewMode.LIST }
+    }
+
+    val defaultPath: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DEFAULT_PATH] ?: "/storage/emulated/0"
+    }
+
+    val autoCloseSessions: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.AUTO_CLOSE_SESSIONS] ?: false
+    }
+
+    val sessionAutoCloseTimeout: Flow<SessionAutoCloseTimeout> = context.dataStore.data.map { prefs ->
+        SessionAutoCloseTimeout.fromName(prefs[Keys.SESSION_AUTO_CLOSE_TIMEOUT])
+    }
+
+    val homeLayout: Flow<HomeLayout> = context.dataStore.data.map(::homeLayoutFromPreferences)
+
+    val searchBarMode: Flow<SearchBarMode> = context.dataStore.data.map { prefs ->
+        SearchBarMode.fromName(prefs[Keys.SEARCH_BAR_MODE])
+    }
+
+    /** 0 means "adaptive" (the stock behaviour); 1..4 pins a fixed column count. */
+    val gridColumns: Flow<Int> = context.dataStore.data.map { prefs ->
+        (prefs[Keys.GRID_COLUMNS] ?: 0).coerceIn(0, 4)
+    }
+
+    suspend fun setSearchBarMode(mode: SearchBarMode) {
+        context.dataStore.edit { it[Keys.SEARCH_BAR_MODE] = mode.name }
+    }
+
+    suspend fun setGridColumns(columns: Int) {
+        context.dataStore.edit { it[Keys.GRID_COLUMNS] = columns.coerceIn(0, 4) }
+    }
+
+    val customPrimary: Flow<Long> = context.dataStore.data.map { prefs ->
+        prefs[Keys.CUSTOM_PRIMARY] ?: 0xFF6750A4
+    }
+
+    val customBackground: Flow<Long> = context.dataStore.data.map { prefs ->
+        prefs[Keys.CUSTOM_BACKGROUND] ?: 0xFF1C1B1F
+    }
+
+    val customSurface: Flow<Long> = context.dataStore.data.map { prefs ->
+        prefs[Keys.CUSTOM_SURFACE] ?: 0xFF2B2930
+    }
+
+    suspend fun setTheme(theme: AppTheme) {
+        context.dataStore.edit { it[Keys.THEME] = theme.name }
+    }
+
+    suspend fun setShowHidden(show: Boolean) {
+        context.dataStore.edit { it[Keys.SHOW_HIDDEN] = show }
+    }
+
+    suspend fun setUseTrash(useTrash: Boolean) {
+        context.dataStore.edit { it[Keys.USE_TRASH] = useTrash }
+    }
+
+    suspend fun setLimitedAccessAccepted(accepted: Boolean) {
+        context.dataStore.edit { it[Keys.LIMITED_ACCESS_ACCEPTED] = accepted }
+    }
+
+    suspend fun setSortBy(sortBy: SortBy) {
+        context.dataStore.edit { it[Keys.SORT_BY] = sortBy.name }
+    }
+
+    suspend fun setSortOrder(order: SortOrder) {
+        context.dataStore.edit { it[Keys.SORT_ORDER] = order.name }
+    }
+
+    suspend fun setViewMode(mode: ViewMode) {
+        context.dataStore.edit { it[Keys.VIEW_MODE] = mode.name }
+    }
+
+    suspend fun setDefaultPath(path: String) {
+        context.dataStore.edit { it[Keys.DEFAULT_PATH] = path }
+    }
+
+    suspend fun setAutoCloseSessions(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.AUTO_CLOSE_SESSIONS] = enabled }
+    }
+
+    suspend fun setSessionAutoCloseTimeout(timeout: SessionAutoCloseTimeout) {
+        context.dataStore.edit { it[Keys.SESSION_AUTO_CLOSE_TIMEOUT] = timeout.name }
+    }
+
+    suspend fun setHomeSectionVisible(section: HomeSection, visible: Boolean) {
+        context.dataStore.edit { preferences ->
+            saveHomeLayout(
+                preferences = preferences,
+                layout = homeLayoutFromPreferences(preferences).withVisibility(section, visible),
+            )
+        }
+    }
+
+    suspend fun moveHomeSection(section: HomeSection, offset: Int) {
+        context.dataStore.edit { preferences ->
+            saveHomeLayout(
+                preferences = preferences,
+                layout = homeLayoutFromPreferences(preferences).move(section, offset),
+            )
+        }
+    }
+
+    suspend fun setHomeLayout(layout: HomeLayout) {
+        context.dataStore.edit { preferences -> saveHomeLayout(preferences, layout) }
+    }
+
+    suspend fun setCustomColors(primary: Long, background: Long, surface: Long) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_PRIMARY] = primary
+            prefs[Keys.CUSTOM_BACKGROUND] = background
+            prefs[Keys.CUSTOM_SURFACE] = surface
+        }
+    }
+
+    private fun homeLayoutFromPreferences(preferences: Preferences): HomeLayout =
+        HomeLayout.fromPersisted(
+            order = preferences[Keys.HOME_SECTION_ORDER],
+            hidden = preferences[Keys.HOME_HIDDEN_SECTIONS],
+        )
+
+    private fun saveHomeLayout(
+        preferences: MutablePreferences,
+        layout: HomeLayout,
+    ) {
+        preferences[Keys.HOME_SECTION_ORDER] = layout.persistedOrder
+        preferences[Keys.HOME_HIDDEN_SECTIONS] = layout.persistedHidden
+    }
+}
